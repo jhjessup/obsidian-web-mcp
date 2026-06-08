@@ -18,7 +18,7 @@ TOKEN = "test-vault-token-do-not-leak"
 
 
 @pytest.fixture(autouse=True)
-def reset_state(monkeypatch):
+def reset_state(monkeypatch, tmp_path):
     """Fresh in-memory stores + known config for every test."""
     oauth._clients.clear()
     oauth._auth_codes.clear()
@@ -28,6 +28,9 @@ def reset_state(monkeypatch):
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_SECRET", "configured-server-secret")
     monkeypatch.setattr(config, "VAULT_OAUTH_REDIRECT_URIS", [])
+    # Persist the client registry to a throwaway path so tests never touch the real
+    # on-disk registry.
+    monkeypatch.setattr(config, "OAUTH_CLIENTS_PATH", tmp_path / "oauth_clients.json")
     yield
 
 
@@ -274,3 +277,37 @@ def test_oauth_protected_resource_metadata(client):
 def test_protected_resource_path_is_auth_exempt():
     from obsidian_vault_mcp.auth import _AUTH_EXEMPT_PATHS
     assert "/.well-known/oauth-protected-resource" in _AUTH_EXEMPT_PATHS
+
+
+# --- Registry persistence across restart --------------------------------------
+
+def test_registration_persists_across_restart(client):
+    """A DCR client survives a server restart (in-memory wipe) via the on-disk
+    registry. Without this, a restart leaves the connected client replaying a
+    client_id the server no longer knows -> 'Invalid or unregistered redirect_uri'."""
+    client_id, redirect = _register(client)
+    assert config.OAUTH_CLIENTS_PATH.exists()
+
+    # Simulate a restart: drop in-memory state, reload from disk.
+    oauth._clients.clear()
+    assert client_id not in oauth._clients
+    oauth._load_clients()
+
+    assert client_id in oauth._clients
+    # redirect_uri validation passes again post-reload, so /oauth/authorize won't 400.
+    assert oauth._redirect_uri_ok(client_id, redirect) is True
+
+
+def test_registry_file_is_owner_only(client):
+    """The persisted registry holds per-client secrets; it must be 0600."""
+    _register(client)
+    mode = config.OAUTH_CLIENTS_PATH.stat().st_mode & 0o777
+    assert mode == 0o600
+
+
+def test_load_clients_tolerates_corrupt_file(client):
+    """A garbage registry file must not crash startup; load is best-effort."""
+    config.OAUTH_CLIENTS_PATH.write_text("{not valid json")
+    oauth._clients.clear()
+    oauth._load_clients()  # must not raise
+    assert oauth._clients == {}

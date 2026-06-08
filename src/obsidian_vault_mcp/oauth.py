@@ -36,7 +36,9 @@ import base64
 import hashlib
 import hmac
 import html
+import json
 import logging
+import os
 import secrets
 import time
 from urllib.parse import urlencode, urlparse
@@ -53,9 +55,61 @@ logger = logging.getLogger(__name__)
 # Maps code -> {client_id, redirect_uri, code_challenge, code_challenge_method, expires_at}
 _auth_codes: dict[str, dict] = {}
 
-# In-memory store for dynamically registered clients.
+# Registry of dynamically registered clients.
 # Maps client_id -> {client_secret, redirect_uris: [...], created_at}
+# Persisted to config.OAUTH_CLIENTS_PATH so registrations survive a restart. An
+# in-memory-only registry is wiped on every restart, which breaks already-connected MCP
+# clients: they replay a client_id the restarted server no longer recognizes, so
+# /oauth/authorize rejects it with "Invalid or unregistered redirect_uri" and the only
+# recourse is removing and re-adding the connector.
 _clients: dict[str, dict] = {}
+
+
+def _load_clients() -> None:
+    """Populate _clients from the on-disk registry. Best-effort; never raises."""
+    path = config.OAUTH_CLIENTS_PATH
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("OAuth client registry unreadable at %s (%s); starting empty", path, e)
+        return
+    if isinstance(data, dict):
+        valid = {}
+        for cid, rec in data.items():
+            if (isinstance(cid, str) and isinstance(rec, dict)
+                    and isinstance(rec.get("client_secret"), str)
+                    and isinstance(rec.get("redirect_uris"), list)
+                    and all(isinstance(u, str) for u in rec["redirect_uris"])):
+                valid[cid] = rec
+        _clients.clear()
+        _clients.update(valid)
+        logger.info("Loaded %d registered OAuth client(s) from %s", len(_clients), path)
+
+
+def _save_clients() -> None:
+    """Persist _clients atomically with owner-only perms (it holds per-client secrets)."""
+    path = config.OAUTH_CLIENTS_PATH
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}")
+        # O_CREAT with 0o600 so the secrets are never briefly world-readable; fchmod
+        # forces 0600 even if a stale tmp from a crashed write pre-existed wider.
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump(_clients, f)
+            f.flush()
+            os.fsync(f.fileno())  # durable before the atomic swap
+        os.replace(tmp, path)  # atomic on POSIX
+    except OSError as e:
+        logger.error("Could not persist OAuth client registry to %s (%s)", path, e)
+
+
+# Load any persisted registrations at import (process startup).
+_load_clients()
 
 
 def _cleanup_codes():
@@ -388,6 +442,7 @@ async def oauth_register(request: Request) -> JSONResponse:
         "redirect_uris": redirect_uris,
         "created_at": time.time(),
     }
+    _save_clients()  # survive restarts; otherwise this registration is lost on reboot
 
     return JSONResponse({
         "client_id": client_id,

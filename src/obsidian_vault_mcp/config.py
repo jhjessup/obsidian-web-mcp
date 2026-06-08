@@ -24,6 +24,16 @@ VAULT_OAUTH_PASSWORD = os.environ.get("VAULT_OAUTH_PASSWORD", "")
 # browser authorization-code flow (it can still use the client_credentials grant).
 VAULT_OAUTH_REDIRECT_URIS = [u.strip() for u in os.environ.get("VAULT_OAUTH_REDIRECT_URIS", "").split(",") if u.strip()]
 
+# Where the dynamically-registered OAuth client registry is persisted. The registry is
+# otherwise in-memory and wiped on every restart, which breaks already-connected MCP
+# clients (they replay a client_id the restarted server no longer knows). Persisting it
+# keeps connectors working across restarts. It holds per-client secrets, so it is written
+# with 0600 perms (see oauth._save_clients). Override with OAUTH_CLIENTS_PATH.
+OAUTH_CLIENTS_PATH = Path(os.environ.get(
+    "OAUTH_CLIENTS_PATH",
+    Path.home() / ".local" / "share" / "vault-mcp" / "oauth_clients.json",
+))
+
 # Network bind address. Defaults to loopback so the server is NOT exposed on the LAN;
 # Cloudflare Tunnel reaches it over localhost. Set to 0.0.0.0 only if you deliberately
 # want direct network exposure.
