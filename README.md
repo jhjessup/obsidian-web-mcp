@@ -245,6 +245,7 @@ uv run --extra dev pytest tests/ -v
 src/obsidian_vault_mcp/
     auth.py                 # Bearer token middleware (Starlette)
     config.py               # Environment variable configuration
+    extensions.py           # Extension seam: base class for adding tools/routes/hooks
     frontmatter_index.py    # In-memory YAML frontmatter index with filesystem watcher
     models.py               # Pydantic input validation models
     oauth.py                # OAuth 2.0 authorization code flow with PKCE
@@ -269,6 +270,54 @@ scripts/
     setup-tunnel.sh         # Interactive Cloudflare Tunnel setup
     launchd/                # macOS launchd plist templates
 ```
+
+### Extending the server
+
+You can add your own tools, HTTP routes, and index hooks **without forking `server.py`**.
+Subclass `extensions.Extension` (every hook is a no-op by default, so override only what
+you need) and run the server with `serve([YourExtension()])` from your own entry point:
+
+```python
+from obsidian_vault_mcp.server import serve
+from obsidian_vault_mcp.extensions import Extension
+
+
+class MyExtension(Extension):
+    def register_tools(self, mcp):
+        # add @mcp.tool tools BEFORE the app/tool schema is built
+        ...
+
+    def before_indexes_start(self, frontmatter_index):
+        # e.g. attach a change listener so no change is missed once the index starts
+        frontmatter_index.add_change_listener(self._on_change)
+
+    def after_indexes_start(self, frontmatter_index):
+        # e.g. start a periodic reconcile loop now that the index is live
+        ...
+
+    def register_routes(self, app):
+        # add Starlette routes (bearer-protected like the rest of the surface)
+        ...
+
+    def shutdown(self):
+        # released at process exit (registered via atexit)
+        ...
+
+
+def main():
+    serve([MyExtension()])
+```
+
+The hooks run in the order above. Two guarantees worth knowing:
+
+- **Extension routes are authenticated.** They're registered before the bearer-auth
+  middleware, so they require the bearer token like every other route. `build_app()`
+  **fails closed** if an extension route collides with an auth-exempt path (`/health`,
+  `/oauth/*`, `/.well-known/*`) so you can't accidentally expose an unauthenticated
+  endpoint. (The method-only off-root `GET/HEAD /` probe isn't path-checkable — don't
+  register there.)
+- **The stock server is unaffected.** With no extensions, `serve()` behaves exactly like
+  the previous `main()`; `FrontmatterIndex` change listeners are a no-op with none registered.
 
 ## VPS Setup With Cloudflare Origin TLS + Caddy Reverse Proxy
 

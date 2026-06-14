@@ -378,13 +378,18 @@ def vault_daily_note_append(content: str) -> str:
     return _vault_daily_note_append(inp.content)
 
 
-def build_app():
+def build_app(extensions=()):
     """Assemble the authenticated Starlette app served to clients.
 
     MCP transport + OAuth routes + (off-root only) the unauthenticated spec probe
-    at GET/HEAD / + the bearer-auth middleware. Extracted from main() so the exact
-    composition that serves the vault can be exercised end-to-end in tests, rather
-    than only the validation helper.
+    at GET/HEAD / + any extension routes + the bearer-auth middleware. Extracted
+    from main() so the exact composition that serves the vault can be exercised
+    end-to-end in tests, rather than only the validation helper.
+
+    extensions: optional iterable of extensions.Extension instances; each
+    register_routes(app) runs before the auth middleware is attached, so extension
+    routes are bearer-protected. A route that collides with an auth-exempt path is
+    rejected (fail closed) so an extension cannot expose an unauthenticated endpoint.
     """
     from starlette.responses import Response
     from starlette.routing import Route
@@ -411,12 +416,44 @@ def build_app():
     for route in oauth_routes:
         app.routes.insert(0, route)
 
+    # Extension routes (e.g. a localhost search endpoint). Added before the auth
+    # middleware so they are bearer-protected like the MCP transport -- UNLESS a
+    # route lands on an auth-exempt path, which the middleware skips before
+    # routing. Detect that and fail closed: an extension must not accidentally
+    # expose an unauthenticated endpoint. (Method-only exemptions such as the
+    # off-root GET/HEAD / probe are not path-checkable here; see Extension docs.)
+    from .auth import _AUTH_EXEMPT_PATHS
+
+    extensions = tuple(extensions)
+    before_paths = {getattr(r, "path", None) for r in app.routes}
+    for ext in extensions:
+        ext.register_routes(app)
+    added_paths = {getattr(r, "path", None) for r in app.routes} - before_paths
+    collisions = added_paths & _AUTH_EXEMPT_PATHS
+    if collisions:
+        raise ValueError(
+            f"extension route(s) collide with auth-exempt path(s) {sorted(collisions)}; "
+            "such routes would be served without bearer authentication"
+        )
+
     app.add_middleware(BearerAuthMiddleware)
     return app
 
 
 def main():
-    """Entry point. Run with streamable HTTP transport."""
+    """Console-script entry point: run the stock server with no extensions."""
+    serve()
+
+
+def serve(extensions=()):
+    """Run the server with the streamable HTTP transport.
+
+    extensions: optional iterable of extensions.Extension instances. A custom
+    deployment calls serve([MyExtension()]) from its own entry point to add tools,
+    routes, and index hooks without forking this module. With no extensions the
+    behavior is identical to the stock server.
+    """
+    extensions = tuple(extensions)  # consumed multiple times; never a generator
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -438,11 +475,25 @@ def main():
     if not VAULT_MCP_TOKEN:
         logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
 
+    # Extension setup: register tools BEFORE the app/tool-schema is built, and let
+    # each extension prepare before the frontmatter index starts (e.g. attach a
+    # change listener so no change is missed between build and listener attach).
+    for ext in extensions:
+        ext.register_tools(mcp)
+        ext.before_indexes_start(frontmatter_index)
+
     # Build the frontmatter index ONCE, before serving. With stateless_http the
     # per-request MCP lifespan would otherwise rebuild it on every request (#28).
     logger.info(f"Starting vault MCP server. Vault: {VAULT_PATH}")
     frontmatter_index.start()
     atexit.register(frontmatter_index.stop)
+
+    # After the index is built and watching: extensions can start dependent work
+    # (e.g. a reconcile loop). shutdown() is registered last so atexit (LIFO) runs
+    # it BEFORE frontmatter_index.stop().
+    for ext in extensions:
+        ext.after_indexes_start(frontmatter_index)
+        atexit.register(ext.shutdown)
 
     # Optional liveness heartbeat. Daemon thread tied to the process (not the
     # per-request lifespan), started only when configured. Validated here so a bad
@@ -464,7 +515,7 @@ def main():
 
     # Build the Starlette app with auth middleware and OAuth endpoints
     try:
-        app = build_app()
+        app = build_app(extensions)
         logger.info(f"Starting server on {VAULT_MCP_HOST}:{VAULT_MCP_PORT} with bearer auth + OAuth")
     except Exception as e:
         # Fail CLOSED: never fall back to an unauthenticated server.
