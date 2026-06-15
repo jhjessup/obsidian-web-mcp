@@ -308,14 +308,23 @@ def main():
     serve([MyExtension()])
 ```
 
-The hooks run in the order above. Two guarantees worth knowing:
+The hooks run in the order above.
 
-- **Extension routes are authenticated.** They're registered before the bearer-auth
-  middleware, so they require the bearer token like every other route. `build_app()`
-  **fails closed** if an extension route collides with an auth-exempt path (`/health`,
-  `/oauth/*`, `/.well-known/*`) so you can't accidentally expose an unauthenticated
-  endpoint. (The method-only off-root `GET/HEAD /` probe isn't path-checkable — don't
-  register there.)
+> **Trust model — read this.** Extensions are **fully-trusted, in-process code** that you
+> choose to load. An extension runs with the server's full privileges: it can read the
+> bearer token and OAuth secrets, read/write your vault, and mutate any route. This is
+> **not a sandbox** — only load extensions you wrote or trust, like any dependency.
+
+Two things worth knowing:
+
+- **Extension routes are authenticated, with a footgun guard.** Routes are registered
+  before the bearer-auth middleware, so they require the bearer token like every other
+  route. As a guardrail against honest mistakes, `build_app()` **fails closed** if an
+  extension adds a route that would cover an auth-exempt path (`/health`, `/oauth/*`,
+  `/.well-known/*`, or the off-root `GET/HEAD /` probe) — including via a wildcard
+  pattern — and rejects extension `Mount`s and `WebSocketRoute`s outright. This catches
+  accidents; it is **not** a boundary against a hostile extension (which, running
+  in-process, could bypass it anyway — see the trust model above).
 - **The stock server is unaffected.** With no extensions, `serve()` behaves exactly like
   the previous `main()`; `FrontmatterIndex` change listeners are a no-op with none registered.
 

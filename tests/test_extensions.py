@@ -114,18 +114,58 @@ def test_serve_accepts_a_generator_of_extensions(vault_dir, monkeypatch):
     ]
 
 
-def test_extension_route_on_exempt_path_is_rejected(vault_dir):
-    """An extension route colliding with an auth-exempt path must fail closed."""
-
-    class ExemptRouteExt(extensions.Extension):
+def _ext_adding(route):
+    class _Ext(extensions.Extension):
         def register_routes(self, app):
-            async def ep(request):
-                return JSONResponse({"leak": True})
+            app.routes.insert(0, route)
+    return _Ext()
 
-            app.routes.insert(0, Route("/health", ep, methods=["GET"]))
 
+async def _leak(request):
+    return JSONResponse({"leak": True})
+
+
+def test_extension_route_on_new_exempt_path_is_rejected(vault_dir):
+    """A brand-new route on an exempt path must fail closed."""
     with pytest.raises(ValueError, match="auth-exempt"):
-        server.build_app([ExemptRouteExt()])
+        server.build_app([_ext_adding(Route("/health", _leak, methods=["GET"]))])
+
+
+def test_extension_route_shadowing_existing_exempt_path_is_rejected(vault_dir):
+    """Inserting a route at an ALREADY-EXISTING exempt path (e.g. /oauth/token) ahead of
+    the built-in must be caught — the identity-diff guard, not a path-string diff."""
+    with pytest.raises(ValueError, match="auth-exempt"):
+        server.build_app([_ext_adding(Route("/oauth/token", _leak, methods=["POST"]))])
+
+
+def test_extension_wildcard_route_covering_exempt_path_is_rejected(vault_dir):
+    """A catch-all pattern that would match an exempt path must fail closed."""
+    with pytest.raises(ValueError, match="auth-exempt"):
+        server.build_app([_ext_adding(Route("/{rest:path}", _leak, methods=["GET"]))])
+
+
+def test_extension_mount_is_rejected(vault_dir):
+    """Mounts are too broad to reason about — rejected outright."""
+    from starlette.routing import Mount
+    with pytest.raises(ValueError, match="[Mm]ount"):
+        server.build_app([_ext_adding(Mount("/x", routes=[]))])
+
+
+def test_benign_extension_route_is_allowed(vault_dir):
+    """A normal non-exempt route (like the overlay's /search) builds fine."""
+    app = server.build_app([_ext_adding(Route("/search", _leak, methods=["GET"]))])
+    assert "/search" in [getattr(r, "path", None) for r in app.routes]
+
+
+def test_extension_websocket_route_is_rejected(vault_dir):
+    """WebSocketRoutes bypass the HTTP bearer middleware entirely -> rejected."""
+    from starlette.routing import WebSocketRoute
+
+    async def ws(websocket):  # pragma: no cover - never reached
+        await websocket.accept()
+
+    with pytest.raises(ValueError, match="WebSocketRoute"):
+        server.build_app([_ext_adding(WebSocketRoute("/oauth/token", ws))])
 
 
 def test_atexit_registration_order_runs_shutdown_before_index_stop(vault_dir, monkeypatch):

@@ -416,25 +416,65 @@ def build_app(extensions=()):
     for route in oauth_routes:
         app.routes.insert(0, route)
 
-    # Extension routes (e.g. a localhost search endpoint). Added before the auth
-    # middleware so they are bearer-protected like the MCP transport -- UNLESS a
-    # route lands on an auth-exempt path, which the middleware skips before
-    # routing. Detect that and fail closed: an extension must not accidentally
-    # expose an unauthenticated endpoint. (Method-only exemptions such as the
-    # off-root GET/HEAD / probe are not path-checkable here; see Extension docs.)
-    from .auth import _AUTH_EXEMPT_PATHS
+    # Extension routes (e.g. a localhost search endpoint), added before the auth
+    # middleware so they are bearer-protected like the MCP transport.
+    #
+    # TRUST MODEL: extensions are fully-trusted, in-process code the operator passes
+    # to serve(). They can do anything the server can (read VAULT_MCP_TOKEN, touch the
+    # vault, mutate any route). This is NOT a sandbox and CANNOT stop a hostile
+    # extension. The check below is a best-effort FOOTGUN guard for honest authors: it
+    # fails closed when a newly-added route would land on an auth-exempt path (which
+    # the bearer middleware skips before routing) and would thus be served
+    # unauthenticated. It does not (and cannot) defend against an extension that
+    # mutates an existing route in place, opens a raw socket, etc.
+    from starlette.routing import Match, Mount, WebSocketRoute
+
+    from .auth import _AUTH_EXEMPT_METHOD_PATHS, _AUTH_EXEMPT_PATHS
 
     extensions = tuple(extensions)
-    before_paths = {getattr(r, "path", None) for r in app.routes}
+    before_ids = {id(r) for r in app.routes}
     for ext in extensions:
         ext.register_routes(app)
-    added_paths = {getattr(r, "path", None) for r in app.routes} - before_paths
-    collisions = added_paths & _AUTH_EXEMPT_PATHS
-    if collisions:
-        raise ValueError(
-            f"extension route(s) collide with auth-exempt path(s) {sorted(collisions)}; "
-            "such routes would be served without bearer authentication"
-        )
+    ext_routes = [r for r in app.routes if id(r) not in before_ids]
+
+    def _covers(route, method, path):
+        """Match enum for route vs (method, path); NONE if the probe can't run."""
+        try:
+            match, _ = route.matches(
+                {"type": "http", "method": method, "path": path, "headers": []}
+            )
+            return match
+        except Exception:
+            logger.warning(
+                "extension route %r could not be auth-checked; allowing "
+                "(trusted-extension model)", getattr(route, "path", route)
+            )
+            return Match.NONE
+
+    for r in ext_routes:
+        # Footguns: a Mount can shadow an exempt prefix; a WebSocketRoute isn't covered
+        # by the HTTP bearer middleware at all. Reject both with a clear error.
+        if isinstance(r, (Mount, WebSocketRoute)):
+            raise ValueError(
+                f"extension {type(r).__name__} is not allowed: it can serve an "
+                "unauthenticated surface -- register plain HTTP Routes instead"
+            )
+        # Method-AGNOSTIC exempt paths: the whole path is unauthenticated, so ANY
+        # coverage (PARTIAL = path matches even if method differs, or FULL) is unsafe.
+        for p in _AUTH_EXEMPT_PATHS:
+            if _covers(r, "GET", p) is not Match.NONE:
+                raise ValueError(
+                    f"extension route {getattr(r, 'path', r)!r} covers auth-exempt path "
+                    f"{p!r}; it would be served without bearer authentication"
+                )
+        # Method-SPECIFIC exempt pairs (e.g. GET/HEAD / probe when off-root): only a
+        # FULL match of that exact method+path is unsafe -- a POST / route is fine.
+        for m, p in _AUTH_EXEMPT_METHOD_PATHS:
+            if _covers(r, m, p) is Match.FULL:
+                raise ValueError(
+                    f"extension route {getattr(r, 'path', r)!r} covers auth-exempt "
+                    f"{m} {p!r}; it would be served without bearer authentication"
+                )
 
     app.add_middleware(BearerAuthMiddleware)
     return app

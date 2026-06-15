@@ -13,6 +13,17 @@ A custom deployment provides its own console entry point, e.g.:
         serve([MyExtension()])
 
 Override only the hooks you need; the rest stay no-ops.
+
+TRUST MODEL
+-----------
+Extensions are FULLY-TRUSTED, in-process code that the operator chooses to load.
+An extension runs with the server's full privileges: it can read the bearer token
+and OAuth secrets from the environment, read/write the vault, and mutate any route.
+This is NOT a sandbox -- only load extensions you wrote or trust, exactly as you
+would any dependency. `build_app()` includes a best-effort FOOTGUN check that fails
+closed if an extension's `register_routes` adds a route on an auth-exempt path (so
+an honest mistake can't silently expose an unauthenticated endpoint), but that is a
+guardrail for accidents, not a security boundary against a hostile extension.
 """
 
 from __future__ import annotations
