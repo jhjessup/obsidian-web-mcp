@@ -25,7 +25,7 @@ from .config import (
     VAULT_MCP_HOST,
     VAULT_MCP_PATH,
     VAULT_MCP_PORT,
-    VAULT_MCP_TOKEN,
+    VAULT_MCP_TOKENS,
     VAULT_PATH,
 )
 from .frontmatter_index import FrontmatterIndex
@@ -669,7 +669,7 @@ def build_app(extensions=()):
     # middleware so they are bearer-protected like the MCP transport.
     #
     # TRUST MODEL: extensions are fully-trusted, in-process code the operator passes
-    # to serve(). They can do anything the server can (read VAULT_MCP_TOKEN, touch the
+    # to serve(). They can do anything the server can (read VAULT_MCP_TOKENS, touch the
     # vault, mutate any route). This is NOT a sandbox and CANNOT stop a hostile
     # extension. The check below is a best-effort FOOTGUN guard for honest authors: it
     # fails closed when a newly-added route would land on an auth-exempt path (which
@@ -760,8 +760,8 @@ def serve(extensions=()):
         logger.error(f"Invalid configuration: {e}")
         sys.exit(1)
 
-    if not VAULT_MCP_TOKEN:
-        logger.warning("VAULT_MCP_TOKEN is not set -- auth will reject all requests")
+    if not VAULT_MCP_TOKENS:
+        logger.warning("VAULT_MCP_TOKENS is not set -- auth will reject all requests")
 
     # Fail CLOSED on a misconfigured audit log: if auditing is requested but the log path
     # is not writable, refuse to start rather than silently dropping mutation records.

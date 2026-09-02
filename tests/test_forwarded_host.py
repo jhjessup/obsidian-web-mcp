@@ -33,7 +33,7 @@ SPOOF_HEADERS = {"Host": SPOOFED, "X-Forwarded-Host": SPOOFED, "X-Forwarded-Prot
 def reset_state(monkeypatch):
     # Isolate from any real env: no pinned public URL unless a test sets one.
     monkeypatch.setattr(config, "VAULT_MCP_PUBLIC_URL", "")
-    monkeypatch.setattr(auth_module, "VAULT_MCP_TOKEN", "secret-token")
+    monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"tester": "secret-token"})
     yield
 
 

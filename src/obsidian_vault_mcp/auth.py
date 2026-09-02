@@ -8,7 +8,6 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 from . import config
-from .config import VAULT_MCP_TOKEN
 from .context import reset_request_context, set_request_context
 
 # Paths that don't require bearer auth (OAuth flow + health)
@@ -55,7 +54,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         if (request.method, request.url.path) in _AUTH_EXEMPT_METHOD_PATHS:
             return await call_next(request)
 
-        if not VAULT_MCP_TOKEN:
+        if not config.VAULT_MCP_TOKENS:
             return JSONResponse(
                 {"error": "Server misconfigured: no auth token set"},
                 status_code=500,
@@ -70,21 +69,31 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
             )
 
         token = auth_header[7:]
-        # Constant-time compare: avoid leaking the token via response timing (#2).
-        if not hmac.compare_digest(token, VAULT_MCP_TOKEN):
+        # Constant-time compare against every configured user's token (#2): scan all
+        # of them rather than stopping at the first match, same rationale as
+        # oauth._check_credentials -- the set is small (a handful of users), so this
+        # stays cheap.
+        matched_username = None
+        for candidate_user, candidate_token in config.VAULT_MCP_TOKENS.items():
+            if hmac.compare_digest(token, candidate_token):
+                matched_username = candidate_user
+        if matched_username is None:
             return JSONResponse(
                 {"error": "Invalid token"},
                 status_code=401,
                 headers={"WWW-Authenticate": _www_authenticate(request, "invalid_token")},
             )
 
-        # Thread the authenticated principal (plus a request id and best-effort client
-        # hint) to the tool layer for the audit log. The raw token never leaves this
-        # context; audit.build_audit_record stores only its SHA-256 hash. client_id is a
-        # User-Agent-derived hint -- it becomes a true per-client id if the static bearer
-        # token is ever replaced with per-client tokens.
+        # Thread the authenticated principal (plus a request id, the resolved
+        # username, and a best-effort client hint) to the tool layer for the audit
+        # log. The raw token never leaves this context; audit.build_audit_record
+        # stores only its SHA-256 hash. Each user now has their own token (see
+        # config.VAULT_MCP_TOKENS), so `username` is what actually distinguishes one
+        # person's activity from another's in the audit trail.
         client = request.headers.get("user-agent", "").strip()[:200] or None
-        ctx_token = set_request_context(principal=token, request_id=uuid.uuid4().hex, client=client)
+        ctx_token = set_request_context(
+            principal=token, request_id=uuid.uuid4().hex, client=client, username=matched_username,
+        )
         try:
             return await call_next(request)
         finally:

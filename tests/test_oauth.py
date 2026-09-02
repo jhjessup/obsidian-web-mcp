@@ -22,9 +22,8 @@ def reset_state(monkeypatch, tmp_path):
     """Fresh in-memory stores + known config for every test."""
     oauth._clients.clear()
     oauth._auth_codes.clear()
-    monkeypatch.setattr(config, "VAULT_MCP_TOKEN", TOKEN)
-    monkeypatch.setattr(config, "VAULT_OAUTH_USERNAME", "obsidian")
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "")  # unset by default
+    monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"obsidian": TOKEN})
+    monkeypatch.setattr(config, "VAULT_OAUTH_USERS", {})  # unset by default
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_SECRET", "configured-server-secret")
     monkeypatch.setattr(config, "VAULT_OAUTH_REDIRECT_URIS", [])
@@ -32,6 +31,12 @@ def reset_state(monkeypatch, tmp_path):
     # on-disk registry.
     monkeypatch.setattr(config, "OAUTH_CLIENTS_PATH", tmp_path / "oauth_clients.json")
     yield
+
+
+def _set_password(monkeypatch, password, username="obsidian"):
+    """Configure a single login user/token pair, mirroring the old single-user
+    VAULT_OAUTH_USERNAME/PASSWORD tests this replaces."""
+    monkeypatch.setattr(config, "VAULT_OAUTH_USERS", {username: password})
 
 
 @pytest.fixture
@@ -82,14 +87,14 @@ def test_register_does_not_leak_configured_secret(client):
     assert r.status_code == 201
     body = r.json()
     assert body["client_secret"] != config.VAULT_OAUTH_CLIENT_SECRET
-    assert body["client_secret"] != config.VAULT_MCP_TOKEN
+    assert body["client_secret"] != TOKEN
     assert len(body["client_secret"]) == 64  # freshly generated per-client
 
 
 # --- The login gate ------------------------------------------------------------
 
 def test_authorize_shows_login_form_when_password_set(client, monkeypatch):
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     client_id, redirect = _register(client)
     _, challenge = _pkce()
     r = client.get("/oauth/authorize", params=_authz_params(client_id, redirect, challenge),
@@ -100,7 +105,7 @@ def test_authorize_shows_login_form_when_password_set(client, monkeypatch):
 
 
 def test_authorize_rejects_wrong_password(client, monkeypatch):
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     client_id, redirect = _register(client)
     _, challenge = _pkce()
     data = _authz_params(client_id, redirect, challenge)
@@ -111,7 +116,7 @@ def test_authorize_rejects_wrong_password(client, monkeypatch):
 
 
 def test_full_flow_with_correct_password(client, monkeypatch):
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     client_id, redirect = _register(client)
     verifier, challenge = _pkce()
     data = _authz_params(client_id, redirect, challenge)
@@ -133,7 +138,7 @@ def test_full_flow_with_correct_password(client, monkeypatch):
 
 
 def test_token_requires_pkce_verifier(client, monkeypatch):
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     client_id, redirect = _register(client)
     verifier, challenge = _pkce()
     data = _authz_params(client_id, redirect, challenge)
@@ -152,7 +157,7 @@ def test_token_requires_pkce_verifier(client, monkeypatch):
 # --- Request validation --------------------------------------------------------
 
 def test_unknown_client_rejected(client, monkeypatch):
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     _, challenge = _pkce()
     r = client.get("/oauth/authorize",
                    params=_authz_params("bogus-client", "https://app.example/cb", challenge),
@@ -162,7 +167,7 @@ def test_unknown_client_rejected(client, monkeypatch):
 
 
 def test_pkce_required_at_authorize(client, monkeypatch):
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     client_id, redirect = _register(client)
     params = _authz_params(client_id, redirect, "")  # empty challenge
     r = client.get("/oauth/authorize", params=params, follow_redirects=False)
@@ -170,7 +175,7 @@ def test_pkce_required_at_authorize(client, monkeypatch):
 
 
 def test_open_redirect_rejected(client, monkeypatch):
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     client_id, _ = _register(client, redirect_uri="https://app.example/cb")
     _, challenge = _pkce()
     # http non-loopback scheme -> rejected
@@ -211,7 +216,7 @@ def _login_and_get_code(client, client_id, redirect, challenge):
 
 def test_token_rejects_client_id_mismatch(client, monkeypatch):
     """A code issued to client A cannot be redeemed by client B (RFC 6749 4.1.3)."""
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     client_id, redirect = _register(client)
     other_id, _ = _register(client, redirect_uri="https://other.example/cb")
     verifier, challenge = _pkce()
@@ -227,7 +232,7 @@ def test_token_rejects_client_id_mismatch(client, monkeypatch):
 def test_operator_client_redirect_requires_allowlist(client, monkeypatch):
     """The operator-configured client_id no longer accepts an arbitrary redirect_uri;
     it must match VAULT_OAUTH_REDIRECT_URIS (#4a fallthrough closed)."""
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     _, challenge = _pkce()
     op = config.VAULT_OAUTH_CLIENT_ID  # not DCR-registered
 
@@ -252,7 +257,7 @@ def test_operator_client_redirect_requires_allowlist(client, monkeypatch):
 def test_registered_client_empty_redirects_denied(client, monkeypatch):
     """A DCR client that registered no usable (https/loopback) redirect_uris
     cannot use the authorization-code flow (no fallthrough)."""
-    monkeypatch.setattr(config, "VAULT_OAUTH_PASSWORD", "hunter2")
+    _set_password(monkeypatch, "hunter2")
     r = client.post("/oauth/register", json={"redirect_uris": ["http://evil.example/cb"]})
     cid = r.json()["client_id"]
     assert r.json()["redirect_uris"] == []  # http non-loopback filtered out

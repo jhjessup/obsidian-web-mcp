@@ -2,8 +2,9 @@
 
 When VAULT_AUDIT_LOG_PATH is set, every vault mutation appends one JSON record to that
 file: a UTC timestamp, a SHA-256 hash of the bearer token (never the token itself), the
-operation, the target path, and the size + checksum of the target before and after the
-change. Read/search operations are logged too when VAULT_AUDIT_LOG_INCLUDE_READS is on.
+username that token belongs to (see config.VAULT_MCP_TOKENS), the operation, the target
+path, and the size + checksum of the target before and after the change. Read/search
+operations are logged too when VAULT_AUDIT_LOG_INCLUDE_READS is on.
 
 Auditing is off unless a log path is configured. At startup the path is validated as
 writable AND rejected if it resolves inside the vault (where the vault tools could rewrite
@@ -198,6 +199,7 @@ def build_audit_record(
     return {
         "timestamp": _now_utc().isoformat(),
         "token_id_hash": _hash_value(ctx.get("principal")),
+        "username": ctx.get("username"),
         "client_id": ctx.get("client"),
         "operation": operation,
         "target_path": target_path,

@@ -156,7 +156,7 @@ def test_assembled_app_default_root_requires_auth(monkeypatch):
     """Default mount: no unauthenticated probe; the transport at / needs a token."""
     try:
         _reload_server(monkeypatch, None)
-        monkeypatch.setattr(auth, "VAULT_MCP_TOKEN", "secret-token")
+        monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"tester": "secret-token"})
         app = server.build_app()
         paths = [getattr(r, "path", None) for r in app.routes]
         assert "/" in paths            # transport mounted at root
@@ -175,7 +175,7 @@ def test_assembled_app_offroot_probe_is_liveness_only(monkeypatch):
     """Off-root: GET/HEAD / is the unauthenticated probe; everything else needs auth."""
     try:
         _reload_server(monkeypatch, "/mcp")
-        monkeypatch.setattr(auth, "VAULT_MCP_TOKEN", "secret-token")
+        monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"tester": "secret-token"})
         app = server.build_app()
         # Non-vacuous: the transport really is mounted off-root, and / is the probe.
         # If build_app stopped mounting the transport, "/mcp" would be absent here

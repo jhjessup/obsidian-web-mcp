@@ -15,8 +15,8 @@ check, so anyone who could reach the URL could obtain the vault bearer token.
 This version closes that hole:
 
 - /oauth/authorize authenticates the human (login form) before issuing any code.
-  It NEVER auto-approves anonymous requests; with no VAULT_OAUTH_PASSWORD set it
-  fails closed (503). The password is required on every authorization, so there is
+  It NEVER auto-approves anonymous requests; with no VAULT_OAUTH_USERS configured it
+  fails closed (503). A password is required on every authorization, so there is
   no ambient session for a cross-site request (or a self-registered attacker
   client) to ride on.
 - /oauth/register is non-authorizing: it stores a client record and returns a
@@ -27,9 +27,15 @@ This version closes that hole:
   token time. This prevents open-redirect / code-exfiltration.
 - PKCE S256 is mandatory on the authorization-code grant.
 
-Remaining hardening tracked separately (see the fix write-up): the issued bearer
-token is still the single static VAULT_MCP_TOKEN. Replacing it with per-client,
-expiring, revocable tokens is a follow-up.
+Multi-user login (VAULT_OAUTH_USERS / VAULT_MCP_TOKENS)
+--------------------------------------------------------
+Earlier versions issued the exact same static VAULT_MCP_TOKEN to every logged-in
+client regardless of which username/password was submitted, so two different people
+were indistinguishable in the audit log. VAULT_OAUTH_USERS now holds one or more
+username:password pairs; the username that authenticates at /oauth/authorize is
+carried through the authorization code and used at /oauth/token to hand back that
+specific user's token from VAULT_MCP_TOKENS. Tokens are still static/long-lived
+(no expiry or rotation) -- revocation means editing VAULT_MCP_TOKENS and restarting.
 """
 
 import base64
@@ -120,17 +126,27 @@ def _cleanup_codes():
 
 
 def _login_configured() -> bool:
-    """True if an interactive login credential is configured."""
-    return bool(config.VAULT_OAUTH_PASSWORD)
+    """True if at least one interactive login credential is configured."""
+    return bool(config.VAULT_OAUTH_USERS)
 
 
-def _check_credentials(username: str, password: str) -> bool:
-    """Constant-time check of the submitted login credentials."""
-    if not config.VAULT_OAUTH_PASSWORD:
-        return False
-    user_ok = hmac.compare_digest(username or "", config.VAULT_OAUTH_USERNAME)
-    pass_ok = hmac.compare_digest(password or "", config.VAULT_OAUTH_PASSWORD)
-    return user_ok and pass_ok
+def _check_credentials(username: str, password: str) -> str | None:
+    """Constant-time check of the submitted login against every configured user.
+
+    Scans ALL configured entries rather than returning on the first match, so the
+    total work done doesn't depend on which (or whether any) username matches --
+    avoiding a timing side-channel that could otherwise reveal valid usernames.
+    Returns the matched username, or None if no entry matches.
+    """
+    username = username or ""
+    password = password or ""
+    matched: str | None = None
+    for candidate_user, candidate_pass in config.VAULT_OAUTH_USERS.items():
+        user_ok = hmac.compare_digest(username, candidate_user)
+        pass_ok = hmac.compare_digest(password, candidate_pass)
+        if user_ok and pass_ok:
+            matched = candidate_user
+    return matched
 
 
 def _redirect_uri_ok(client_id: str, redirect_uri: str) -> bool:
@@ -163,7 +179,8 @@ def _client_known(client_id: str) -> bool:
 
 
 def _issue_code_redirect(client_id: str, redirect_uri: str, state: str,
-                         code_challenge: str, code_challenge_method: str):
+                         code_challenge: str, code_challenge_method: str,
+                         username: str):
     """Mint an authorization code and 302 back to the client."""
     _cleanup_codes()
     code = secrets.token_urlsafe(32)
@@ -172,9 +189,10 @@ def _issue_code_redirect(client_id: str, redirect_uri: str, state: str,
         "redirect_uri": redirect_uri,
         "code_challenge": code_challenge,
         "code_challenge_method": code_challenge_method,
+        "username": username,
         "expires_at": time.time() + 300,  # 5 minute expiry
     }
-    logger.info("OAuth authorization code issued after successful login.")
+    logger.info("OAuth authorization code issued after successful login for user %r.", username)
     params = {"code": code}
     if state:
         params["state"] = state
@@ -225,7 +243,7 @@ def _login_form(params: dict, error: str = "") -> HTMLResponse:
 def _misconfigured_page() -> HTMLResponse:
     return HTMLResponse(
         "<h1>Server not configured for login</h1>"
-        "<p>This server requires <code>VAULT_OAUTH_PASSWORD</code> to be set before it can "
+        "<p>This server requires <code>VAULT_OAUTH_USERS</code> to be set before it can "
         "authorize access to your vault. Set it and restart.</p>",
         status_code=503,
     )
@@ -312,7 +330,7 @@ async def oauth_authorize(request: Request):
     # no "auto-approve" escape hatch — an unauthenticated authorize endpoint is
     # exactly the vulnerability this fix closes (issues #8 / #29).
     if not _login_configured():
-        logger.error("Refusing to authorize: VAULT_OAUTH_PASSWORD is not set.")
+        logger.error("Refusing to authorize: VAULT_OAUTH_USERS is not set.")
         return _misconfigured_page()
 
     if request.method != "POST":
@@ -320,11 +338,12 @@ async def oauth_authorize(request: Request):
         return _login_form(oauth_params)
 
     # POST: verify the submitted credentials.
-    if not _check_credentials(form.get("username", ""), form.get("password", "")):
+    matched_user = _check_credentials(form.get("username", ""), form.get("password", ""))
+    if not matched_user:
         logger.warning("OAuth login failed.")
         return _login_form(oauth_params, error="Incorrect username or password.")
 
-    return _issue_code_redirect(client_id, redirect_uri, state, code_challenge, code_challenge_method)
+    return _issue_code_redirect(client_id, redirect_uri, state, code_challenge, code_challenge_method, matched_user)
 
 
 async def oauth_token(request: Request) -> JSONResponse:
@@ -380,9 +399,20 @@ async def _handle_authorization_code(form) -> JSONResponse:
     if not hmac.compare_digest(computed_challenge, code_data["code_challenge"]):
         return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
 
-    logger.info("OAuth token issued via authorization_code grant.")
+    # Hand back the token for the specific user who logged in at /oauth/authorize --
+    # NOT a single shared token -- so different people are distinguishable downstream
+    # (see auth.py / audit.py). validate_config() guarantees every VAULT_OAUTH_USERS
+    # entry has a matching token, but a code can outlive a config reload in theory, so
+    # this stays defensive rather than assuming the lookup always succeeds.
+    username = code_data.get("username")
+    token = config.VAULT_MCP_TOKENS.get(username or "")
+    if not token:
+        logger.error("No VAULT_MCP_TOKENS entry for authenticated user %r.", username)
+        return JSONResponse({"error": "server_error"}, status_code=500)
+
+    logger.info("OAuth token issued via authorization_code grant for user %r.", username)
     return JSONResponse({
-        "access_token": config.VAULT_MCP_TOKEN,
+        "access_token": token,
         "token_type": "bearer",
         "expires_in": 86400,
     })
@@ -393,6 +423,12 @@ async def _handle_client_credentials(client_id: str, client_secret: str) -> JSON
 
     Validated against the configured VAULT_OAUTH_CLIENT_ID/SECRET. Note: /oauth/register
     no longer hands these out, so this path requires the operator's real secret.
+
+    This grant isn't tied to a specific human login, so there's no "matched user" to
+    key off of the way the authorization_code grant has. It's handed the token of the
+    lexicographically-first configured user (deterministic, documented here) -- fine
+    for a single automation identity; if you need this grant itself split per-caller,
+    that's a bigger change than this fork makes.
     """
     if not config.VAULT_OAUTH_CLIENT_SECRET:
         return JSONResponse({"error": "server_error"}, status_code=500)
@@ -403,9 +439,12 @@ async def _handle_client_credentials(client_id: str, client_secret: str) -> JSON
         logger.warning("OAuth client_credentials failed.")
         return JSONResponse({"error": "invalid_client"}, status_code=401)
 
-    logger.info("OAuth token issued via client_credentials grant.")
+    if not config.VAULT_MCP_TOKENS:
+        return JSONResponse({"error": "server_error"}, status_code=500)
+    default_user = sorted(config.VAULT_MCP_TOKENS)[0]
+    logger.info("OAuth token issued via client_credentials grant (as user %r).", default_user)
     return JSONResponse({
-        "access_token": config.VAULT_MCP_TOKEN,
+        "access_token": config.VAULT_MCP_TOKENS[default_user],
         "token_type": "bearer",
         "expires_in": 86400,
     })

@@ -3,8 +3,35 @@ from pathlib import Path
 
 # Vault configuration
 VAULT_PATH = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/Obsidian/MyVault")))
-VAULT_MCP_TOKEN = os.environ.get("VAULT_MCP_TOKEN", "")
 VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
+
+
+def _parse_pairs(raw: str) -> dict[str, str]:
+    """Parse a "name:value,name2:value2" (comma- or newline-separated) list into a dict.
+
+    Splits each entry on the FIRST colon only, so a value is free to contain colons
+    itself. Blank entries (extra separators, trailing newline) are skipped. Used for
+    both VAULT_OAUTH_USERS and VAULT_MCP_TOKENS, which share this exact shape.
+    """
+    pairs: dict[str, str] = {}
+    for chunk in raw.replace("\n", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        name, sep, value = chunk.partition(":")
+        if not sep:
+            continue
+        pairs[name.strip()] = value.strip()
+    return pairs
+
+
+# Per-user bearer tokens, "username:token,username2:token2". Each entry in
+# VAULT_OAUTH_USERS below must have a matching entry here (enforced in
+# validate_config()) -- every human who can log in gets their own token, rather than
+# every login sharing one static VAULT_MCP_TOKEN. This is what lets the audit log
+# (see audit.py) attribute a mutation to a specific person instead of an
+# indistinguishable shared credential.
+VAULT_MCP_TOKENS = _parse_pairs(os.environ.get("VAULT_MCP_TOKENS", ""))
 
 # Daily-note tools. FOLDER "" means the vault root; FORMAT/TEMPLATE are strftime
 # patterns. All optional with safe defaults; resolved paths still go through
@@ -29,10 +56,15 @@ VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 # Interactive login gate on /oauth/authorize. The OAuth browser step authenticates
 # the *human* before any authorization code is issued. Without this, anyone who can
 # reach the URL can complete the flow and obtain a vault token (see issues #8/#29).
-# The password is required on every authorization, so there is no ambient session
+# A password is required on every authorization, so there is no ambient session
 # cookie for a cross-site request to ride on.
-VAULT_OAUTH_USERNAME = os.environ.get("VAULT_OAUTH_USERNAME", "obsidian")
-VAULT_OAUTH_PASSWORD = os.environ.get("VAULT_OAUTH_PASSWORD", "")
+#
+# VAULT_OAUTH_USERS holds one or more "username:password" pairs, comma- or
+# newline-separated -- each a distinct human who may log in, each with their own
+# token in VAULT_MCP_TOKENS. Kept as VAULT_OAUTH_USERS (not a single pair) because
+# the previous single-username/password model gave every logged-in client the exact
+# same downstream bearer token, making two people indistinguishable in the audit log.
+VAULT_OAUTH_USERS = _parse_pairs(os.environ.get("VAULT_OAUTH_USERS", ""))
 
 # Allowed redirect URIs for the operator-configured client (VAULT_OAUTH_CLIENT_ID),
 # comma-separated. Dynamically-registered clients carry their own redirect_uris; this
@@ -219,6 +251,21 @@ def _validate_mcp_path(path: str) -> None:
         )
 
 
+def _validate_users_have_tokens() -> None:
+    """Every configured login must have a matching bearer token.
+
+    A username in VAULT_OAUTH_USERS with no entry in VAULT_MCP_TOKENS would let
+    that person log in but then hit "server misconfigured" on every MCP call --
+    fail closed at startup instead, with a message naming the gap.
+    """
+    missing = sorted(set(VAULT_OAUTH_USERS) - set(VAULT_MCP_TOKENS))
+    if missing:
+        raise ValueError(
+            "VAULT_MCP_TOKENS is missing an entry for: " + ", ".join(missing) +
+            " -- every user in VAULT_OAUTH_USERS needs a matching token."
+        )
+
+
 def validate_config() -> None:
     """Validate operator-supplied configuration at startup.
 
@@ -226,3 +273,4 @@ def validate_config() -> None:
     CLOSED with a clear message instead of booting a broken or insecure server.
     """
     _validate_mcp_path(VAULT_MCP_PATH)
+    _validate_users_have_tokens()

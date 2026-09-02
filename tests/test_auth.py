@@ -7,12 +7,13 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from obsidian_vault_mcp import auth as auth_module
+from obsidian_vault_mcp import config
 
 
 @pytest.fixture
 def client(monkeypatch):
-    # Bind a known token into the middleware's module namespace.
-    monkeypatch.setattr(auth_module, "VAULT_MCP_TOKEN", "secret-token")
+    # Bind a known user's token into config, which the middleware reads live.
+    monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"tester": "secret-token"})
 
     async def ok(request):
         return PlainTextResponse("ok")

@@ -35,7 +35,7 @@ def vault_dir(tmp_path, monkeypatch):
 
     # Set environment variable for config module
     monkeypatch.setenv("VAULT_PATH", str(vault))
-    monkeypatch.setenv("VAULT_MCP_TOKEN", "test-token-12345")
+    monkeypatch.setenv("VAULT_MCP_TOKENS", "tester:test-token-12345")
 
     # Reload config to pick up new env var
     import obsidian_vault_mcp.config as config

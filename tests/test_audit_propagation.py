@@ -17,12 +17,12 @@ from obsidian_vault_mcp.context import current_request_context
 
 
 def test_principal_propagates_to_sync_handler(monkeypatch):
-    monkeypatch.setattr(auth_module, "VAULT_MCP_TOKEN", "secret-token")
+    monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"alice": "secret-token"})
 
     def sync_probe(request):  # sync on purpose: mirrors how FastMCP runs vault_* tools
         ctx = current_request_context()
         return JSONResponse({"principal": ctx.get("principal"), "client": ctx.get("client"),
-                             "request_id": ctx.get("request_id")})
+                             "request_id": ctx.get("request_id"), "username": ctx.get("username")})
 
     app = Starlette(routes=[Route("/probe", sync_probe)])
     app.add_middleware(auth_module.BearerAuthMiddleware)
@@ -35,6 +35,7 @@ def test_principal_propagates_to_sync_handler(monkeypatch):
     assert body["principal"] == "secret-token"   # null here => token_id_hash null in prod
     assert body["client"] == "probe/1"
     assert body["request_id"]
+    assert body["username"] == "alice"   # token -> username resolution, not a shared token
 
 
 def test_context_clean_outside_request():

@@ -11,7 +11,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from obsidian_vault_mcp import auth as auth_module
-from obsidian_vault_mcp import extensions, server
+from obsidian_vault_mcp import config, extensions, server
 from obsidian_vault_mcp.frontmatter_index import FrontmatterIndex
 
 
@@ -62,7 +62,7 @@ def test_build_app_registers_extension_routes(vault_dir):
 
 def test_extension_route_is_bearer_protected(vault_dir, monkeypatch):
     """An extension route added before the middleware must require the bearer token."""
-    monkeypatch.setattr(auth_module, "VAULT_MCP_TOKEN", "secret-token")
+    monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"tester": "secret-token"})
     client = TestClient(server.build_app([SpyExtension()]))
     assert client.get("/__ext_probe").status_code == 401
     ok = client.get("/__ext_probe", headers={"Authorization": "Bearer secret-token"})
