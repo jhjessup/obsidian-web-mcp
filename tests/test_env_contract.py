@@ -2,11 +2,11 @@
 config.py actually reads.
 
 This is the mechanism that catches env-var drift *in the app repo, before it
-ships* -- the deployment repo (jessups-gitops) separately lints its
-ConfigMap/Secret keys against a copy of ENV_CONTRACT.toml, but that check can
-only be as good as this file being kept honest against the real source. A
-stale ENV_CONTRACT.toml is exactly as dangerous as a stale k8s manifest: both
-let someone believe a variable is read when it isn't (or vice versa).
+ships* -- a deployment repo can separately lint its own manifest's keys
+against a copy of ENV_CONTRACT.toml, but that check can only be as good as
+this file being kept honest against the real source. A stale ENV_CONTRACT.toml
+is exactly as dangerous as a stale deployment manifest: both let someone
+believe a variable is read when it isn't (or vice versa).
 """
 
 import ast

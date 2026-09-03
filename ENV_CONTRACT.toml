@@ -2,12 +2,12 @@
 #
 # tests/test_env_contract.py fails CI if config.py's actual os.environ reads drift
 # from this file -- add, rename, or remove a variable here in the SAME PR that
-# changes config.py. This exists because a deployment's k8s ConfigMap/Secret keys
-# are the *other* half of this contract and live in a different repo
-# (jessups-gitops); that repo's CI vendors/fetches this file and lints
-# apps/vellum/{configmap,secret*}.yaml keys against it -- see that repo's
-# .github/workflows/lint-vellum-env.yml. A stale ConfigMap/Secret (e.g. keys from
-# a shape config.py no longer reads) previously failed OPEN: the server booted
+# changes config.py. This exists because a deployment's k8s (or other) manifest
+# keys are the *other* half of this contract and necessarily live in a separate
+# deployment repo, outside this project's view -- a deployment's CI can vendor or
+# fetch this file and lint its own ConfigMap/Secret keys against it, the same way
+# this file is checked against config.py here. A stale manifest (e.g. keys from a
+# shape config.py no longer reads) previously failed OPEN: the server booted
 # healthy with the stale keys silently ignored. This file, plus the fail-closed
 # check in config._validate_users_have_tokens, is how that class of bug gets
 # caught before it ships instead of after.
@@ -77,6 +77,12 @@ name = "VAULT_OAUTH_CLIENT_SECRET"
 required = false
 sensitive = true
 description = "Static operator OAuth client secret"
+
+[[fixed]]
+name = "VAULT_OAUTH_CLIENT_USER"
+required = false
+sensitive = false
+description = "Which configured user's token the client_credentials grant hands out; falls back to the lexicographically-first user when unset"
 
 [[fixed]]
 name = "VAULT_OAUTH_REDIRECT_URIS"

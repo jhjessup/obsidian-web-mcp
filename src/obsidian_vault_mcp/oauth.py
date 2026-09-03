@@ -425,10 +425,13 @@ async def _handle_client_credentials(client_id: str, client_secret: str) -> JSON
     no longer hands these out, so this path requires the operator's real secret.
 
     This grant isn't tied to a specific human login, so there's no "matched user" to
-    key off of the way the authorization_code grant has. It's handed the token of the
-    lexicographically-first configured user (deterministic, documented here) -- fine
-    for a single automation identity; if you need this grant itself split per-caller,
-    that's a bigger change than this fork makes.
+    key off of the way the authorization_code grant has. It's handed the token of
+    VAULT_OAUTH_CLIENT_USER when set (validated at startup to name an actually-
+    configured user -- config._validate_oauth_client_user); otherwise it falls back
+    to the lexicographically-first configured user (deterministic, documented here,
+    the pre-existing default). Fine for a single automation identity either way; if
+    you need this grant itself split per-caller, that's a bigger change than this
+    fork makes.
     """
     if not config.VAULT_OAUTH_CLIENT_SECRET:
         return JSONResponse({"error": "server_error"}, status_code=500)
@@ -441,7 +444,7 @@ async def _handle_client_credentials(client_id: str, client_secret: str) -> JSON
 
     if not config.VAULT_MCP_TOKENS:
         return JSONResponse({"error": "server_error"}, status_code=500)
-    default_user = sorted(config.VAULT_MCP_TOKENS)[0]
+    default_user = config.VAULT_OAUTH_CLIENT_USER or sorted(config.VAULT_MCP_TOKENS)[0]
     logger.info("OAuth token issued via client_credentials grant (as user %r).", default_user)
     return JSONResponse({
         "access_token": config.VAULT_MCP_TOKENS[default_user],

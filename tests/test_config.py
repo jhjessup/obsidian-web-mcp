@@ -129,6 +129,26 @@ def test_incomplete_triple_excluded_and_flagged(monkeypatch):
         cfg.validate_config()
 
 
+def test_oauth_client_user_must_be_a_configured_user(monkeypatch):
+    """VAULT_OAUTH_CLIENT_USER is validated so a typo surfaces as an explained
+    startup failure, not a confusing server_error on the client_credentials grant."""
+    _clear_user_env(monkeypatch)
+    monkeypatch.setenv("VAULT_USER_ALICE_USERNAME", "alice")
+    monkeypatch.setenv("VAULT_USER_ALICE_PASSWORD", "hunter2")
+    monkeypatch.setenv("VAULT_USER_ALICE_TOKEN", "alice-token")
+    monkeypatch.setenv("VAULT_OAUTH_CLIENT_USER", "bob")
+    cfg = importlib.reload(config_module)
+
+    with pytest.raises(ValueError, match="VAULT_OAUTH_CLIENT_USER"):
+        cfg.validate_config()
+
+    monkeypatch.setenv("VAULT_OAUTH_CLIENT_USER", "alice")
+    cfg = importlib.reload(config_module)
+    cfg.validate_config()  # must not raise
+
+    monkeypatch.delenv("VAULT_OAUTH_CLIENT_USER", raising=False)
+
+
 def test_zero_users_configured_fails_closed(monkeypatch):
     """An empty VAULT_OAUTH_USERS must fail validate_config(), not boot healthy with
     every login silently rejected -- this is the exact failure mode a stale

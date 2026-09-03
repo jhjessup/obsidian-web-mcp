@@ -26,6 +26,7 @@ def reset_state(monkeypatch, tmp_path):
     monkeypatch.setattr(config, "VAULT_OAUTH_USERS", {})  # unset by default
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
     monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_SECRET", "configured-server-secret")
+    monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_USER", "")
     monkeypatch.setattr(config, "VAULT_OAUTH_REDIRECT_URIS", [])
     # Persist the client registry to a throwaway path so tests never touch the real
     # on-disk registry.
@@ -316,3 +317,33 @@ def test_load_clients_tolerates_corrupt_file(client):
     oauth._clients.clear()
     oauth._load_clients()  # must not raise
     assert oauth._clients == {}
+
+
+# --- client_credentials grant: which user it acts as ------------------------
+
+def _cc_token(client, client_id="vault-mcp-client", secret="configured-server-secret"):
+    return client.post("/oauth/token", data={
+        "grant_type": "client_credentials", "client_id": client_id, "client_secret": secret,
+    })
+
+
+def test_client_credentials_defaults_to_lexicographically_first_user(client, monkeypatch):
+    monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_USER", "")
+    monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"zed": "zed-token", "alice": "alice-token"})
+    tok = _cc_token(client)
+    assert tok.status_code == 200
+    assert tok.json()["access_token"] == "alice-token"
+
+
+def test_client_credentials_honors_explicit_user_override(client, monkeypatch):
+    monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_USER", "zed")
+    monkeypatch.setattr(config, "VAULT_MCP_TOKENS", {"zed": "zed-token", "alice": "alice-token"})
+    tok = _cc_token(client)
+    assert tok.status_code == 200
+    assert tok.json()["access_token"] == "zed-token"
+
+
+def test_client_credentials_rejects_wrong_secret(client, monkeypatch):
+    monkeypatch.setattr(config, "VAULT_OAUTH_CLIENT_USER", "")
+    tok = _cc_token(client, secret="wrong-secret")
+    assert tok.status_code == 401

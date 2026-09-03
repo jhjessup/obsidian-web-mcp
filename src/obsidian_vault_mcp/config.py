@@ -139,6 +139,16 @@ VAULT_MCP_PATH = os.environ.get("VAULT_MCP_PATH", "/")
 VAULT_OAUTH_CLIENT_ID = os.environ.get("VAULT_OAUTH_CLIENT_ID", "vault-mcp-client")
 VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 
+# Which configured user's bearer token the client_credentials (machine-to-machine)
+# grant hands out -- oauth._handle_client_credentials isn't tied to a human login,
+# so there's no "matched user" to key off of the way authorization_code has. Left
+# unset, it falls back to the lexicographically-first configured user (the
+# pre-existing, still-supported default); set this explicitly once
+# VAULT_PERMISSIONS_ENABLED is on, since that alphabetical accident otherwise
+# decides which specific person's path permissions every machine client silently
+# inherits. Validated in validate_config(): must name an actually-configured user.
+VAULT_OAUTH_CLIENT_USER = os.environ.get("VAULT_OAUTH_CLIENT_USER", "").strip()
+
 # Interactive login gate on /oauth/authorize. The OAuth browser step authenticates
 # the *human* before any authorization code is issued. Without this, anyone who can
 # reach the URL can complete the flow and obtain a vault token (see issues #8/#29).
@@ -426,6 +436,20 @@ def _validate_shares_path_outside_vault() -> None:
         )
 
 
+def _validate_oauth_client_user() -> None:
+    """VAULT_OAUTH_CLIENT_USER, if set, must name an actually-configured user.
+
+    A typo'd or stale username here would otherwise surface as a confusing
+    server_error on the client_credentials grant instead of an explained
+    startup failure -- same reasoning as _validate_users_have_tokens.
+    """
+    if VAULT_OAUTH_CLIENT_USER and VAULT_OAUTH_CLIENT_USER not in VAULT_OAUTH_USERS:
+        raise ValueError(
+            f"VAULT_OAUTH_CLIENT_USER {VAULT_OAUTH_CLIENT_USER!r} is not one of the "
+            "configured VAULT_USER_<GROUP>_USERNAME values."
+        )
+
+
 def validate_config() -> None:
     """Validate operator-supplied configuration at startup.
 
@@ -434,5 +458,6 @@ def validate_config() -> None:
     """
     _validate_mcp_path(VAULT_MCP_PATH)
     _validate_users_have_tokens()
+    _validate_oauth_client_user()
     _validate_user_roots()
     _validate_shares_path_outside_vault()
