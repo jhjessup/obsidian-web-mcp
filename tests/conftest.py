@@ -1,5 +1,6 @@
 """Test fixtures for the Obsidian vault MCP server."""
 
+import importlib
 import os
 import tempfile
 from pathlib import Path
@@ -39,8 +40,15 @@ def vault_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("VAULT_USER_TESTER_PASSWORD", "test-password")
     monkeypatch.setenv("VAULT_USER_TESTER_TOKEN", "test-token-12345")
 
-    # Reload config to pick up new env var
+    # Actually reload (not just re-import, which is a no-op on an already-imported
+    # module) so VAULT_OAUTH_USERS/VAULT_MCP_TOKENS reflect the VAULT_USER_TESTER_*
+    # vars just set above -- validate_config() now fails closed on an empty
+    # VAULT_OAUTH_USERS (see config._validate_users_have_tokens), and server.serve()
+    # calls it, so any test driving serve() needs this fixture to have actually
+    # populated a user, not left config's module-level globals at whatever they were
+    # when config.py first happened to be imported.
     import obsidian_vault_mcp.config as config
+    importlib.reload(config)
     config.VAULT_PATH = Path(str(vault))
 
     yield vault

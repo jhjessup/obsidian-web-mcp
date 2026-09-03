@@ -127,3 +127,17 @@ def test_incomplete_triple_excluded_and_flagged(monkeypatch):
 
     with pytest.raises(ValueError, match="BROKEN"):
         cfg.validate_config()
+
+
+def test_zero_users_configured_fails_closed(monkeypatch):
+    """An empty VAULT_OAUTH_USERS must fail validate_config(), not boot healthy with
+    every login silently rejected -- this is the exact failure mode a stale
+    VAULT_OAUTH_USERS/VAULT_MCP_TOKENS blob Secret (the shape this per-user scheme
+    replaced) produces: no keys match VAULT_USER_<GROUP>_*, so there's nothing
+    "incomplete" to flag, just zero users."""
+    _clear_user_env(monkeypatch)
+    cfg = importlib.reload(config_module)
+    assert cfg.VAULT_OAUTH_USERS == {}
+
+    with pytest.raises(ValueError, match="No VAULT_USER"):
+        cfg.validate_config()

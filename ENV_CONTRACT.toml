@@ -1,0 +1,152 @@
+# Enumerates every environment variable src/obsidian_vault_mcp/config.py reads.
+#
+# tests/test_env_contract.py fails CI if config.py's actual os.environ reads drift
+# from this file -- add, rename, or remove a variable here in the SAME PR that
+# changes config.py. This exists because a deployment's k8s ConfigMap/Secret keys
+# are the *other* half of this contract and live in a different repo
+# (jessups-gitops); that repo's CI vendors/fetches this file and lints
+# apps/vellum/{configmap,secret*}.yaml keys against it -- see that repo's
+# .github/workflows/lint-vellum-env.yml. A stale ConfigMap/Secret (e.g. keys from
+# a shape config.py no longer reads) previously failed OPEN: the server booted
+# healthy with the stale keys silently ignored. This file, plus the fail-closed
+# check in config._validate_users_have_tokens, is how that class of bug gets
+# caught before it ships instead of after.
+
+[[fixed]]
+name = "VAULT_PATH"
+required = false
+sensitive = false
+description = "Vault root directory inside the container"
+
+[[fixed]]
+name = "VAULT_MCP_PORT"
+required = false
+sensitive = false
+description = "TCP port the server listens on"
+
+[[fixed]]
+name = "VAULT_DEFAULT_ROOTS"
+required = false
+sensitive = false
+description = "Fallback permission roots (prefix:bits,...) for any user with no explicit VAULT_USER_<GROUP>_ROOTS"
+
+[[fixed]]
+name = "VAULT_PERMISSIONS_ENABLED"
+required = false
+sensitive = false
+description = "Gates all per-path permission enforcement and the vault_share/vault_unshare/vault_shares tools"
+
+[[fixed]]
+name = "VAULT_SHARES_PATH"
+required = false
+sensitive = false
+description = "Where runtime vault_share/vault_unshare grants are persisted; must be outside VAULT_PATH and on a PersistentVolume to survive a restart"
+
+[[fixed]]
+name = "VAULT_DAILY_NOTES_FOLDER"
+required = false
+sensitive = false
+description = "Folder (relative to vault root) daily notes live in; empty means vault root"
+
+[[fixed]]
+name = "VAULT_DAILY_NOTES_FORMAT"
+required = false
+sensitive = false
+description = "strftime pattern for the daily note filename"
+
+[[fixed]]
+name = "VAULT_DAILY_NOTES_TEMPLATE"
+required = false
+sensitive = false
+description = "Relative path to a template file for new daily notes"
+
+[[fixed]]
+name = "VAULT_MCP_PATH"
+required = false
+sensitive = false
+description = "HTTP path the MCP transport is mounted at"
+
+[[fixed]]
+name = "VAULT_OAUTH_CLIENT_ID"
+required = false
+sensitive = false
+description = "Static operator OAuth client id"
+
+[[fixed]]
+name = "VAULT_OAUTH_CLIENT_SECRET"
+required = false
+sensitive = true
+description = "Static operator OAuth client secret"
+
+[[fixed]]
+name = "VAULT_OAUTH_REDIRECT_URIS"
+required = false
+sensitive = false
+description = "Comma-separated allowed redirect URIs for the static operator client"
+
+[[fixed]]
+name = "OAUTH_CLIENTS_PATH"
+required = false
+sensitive = false
+description = "Where dynamically-registered OAuth clients are persisted; must be on a PersistentVolume to survive a restart"
+
+[[fixed]]
+name = "VAULT_MCP_HOST"
+required = false
+sensitive = false
+description = "Bind address; 0.0.0.0 when reached through an Ingress, 127.0.0.1 for loopback-only tunnels"
+
+[[fixed]]
+name = "VAULT_MCP_ALLOWED_HOSTS"
+required = false
+sensitive = false
+description = "Comma-separated extra hostnames allowed through DNS-rebinding protection; must match the Ingress host"
+
+[[fixed]]
+name = "VAULT_MCP_FORWARDED_ALLOW_IPS"
+required = false
+sensitive = false
+description = "Client IPs trusted to set X-Forwarded-* headers"
+
+[[fixed]]
+name = "VAULT_MCP_PUBLIC_URL"
+required = false
+sensitive = false
+description = "Canonical public origin pinned into OAuth discovery metadata; should match the Ingress host"
+
+[[fixed]]
+name = "VAULT_MCP_HEARTBEAT_URL"
+required = false
+sensitive = true
+description = "Optional push-style uptime monitor URL (capability URL, treat as sensitive)"
+
+[[fixed]]
+name = "VAULT_MCP_HEARTBEAT_INTERVAL"
+required = false
+sensitive = false
+description = "Seconds between heartbeat pings"
+
+[[fixed]]
+name = "VAULT_AUDIT_LOG_PATH"
+required = false
+sensitive = false
+description = "Append-only JSONL audit log path; empty disables auditing"
+
+[[fixed]]
+name = "VAULT_AUDIT_LOG_INCLUDE_READS"
+required = false
+sensitive = false
+description = "Also audit read/search operations, not just mutations"
+
+# Per-user credential quadruple: config.py scans the environment for every key
+# matching VAULT_USER_<GROUP>_USERNAME, then looks up the three siblings below for
+# the same <GROUP>. <GROUP> is an arbitrary grouping key the operator chooses (the
+# username itself, uppercased, is the readable convention) -- it is never read or
+# validated on its own, only used to tie one person's four vars together. At least
+# one complete group (USERNAME+PASSWORD+TOKEN) must be present, or the server fails
+# closed at startup (config._validate_users_have_tokens).
+[dynamic.per_user]
+prefix = "VAULT_USER_"
+required_suffixes = ["USERNAME", "PASSWORD", "TOKEN"]
+optional_suffixes = ["ROOTS"]
+description = "One Kubernetes Secret per person is the intended shape: VAULT_USER_<GROUP>_USERNAME/_PASSWORD/_TOKEN (required) and _ROOTS (optional, only used when VAULT_PERMISSIONS_ENABLED is set)"

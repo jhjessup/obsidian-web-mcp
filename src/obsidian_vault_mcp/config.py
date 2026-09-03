@@ -336,7 +336,8 @@ def _validate_mcp_path(path: str) -> None:
 
 
 def _validate_users_have_tokens() -> None:
-    """Every configured login must have a matching bearer token.
+    """Every configured login must have a matching bearer token, and at least one
+    login must be configured at all.
 
     _load_users_from_env() already guarantees VAULT_OAUTH_USERS and VAULT_MCP_TOKENS
     are pairwise consistent (an incomplete VAULT_USER_<GROUP>_* triple is excluded
@@ -346,7 +347,24 @@ def _validate_users_have_tokens() -> None:
     login silently vanish rather than erroring is exactly the kind of gap that would
     otherwise surface as a confusing runtime 401 instead of an explained startup
     failure.
+
+    The zero-groups case is the same failure mode one level up: an env-var rename in
+    this module (e.g. the VAULT_OAUTH_USERS/VAULT_MCP_TOKENS blob shape this per-user
+    scheme replaced) leaves a k8s Secret whose keys this server no longer reads at
+    all. With no incomplete groups (there's nothing to be incomplete -- the keys just
+    don't match the VAULT_USER_<GROUP>_* pattern), the old check passed straight
+    through and the server booted healthy with zero logins configured: /health said
+    ok, and every human got a mystifying 401 with nothing in the startup log to
+    explain why. Failing closed here turns that into a CrashLoopBackOff with a
+    message naming the actual missing pattern -- diagnosable without a debugger.
     """
+    if not VAULT_OAUTH_USERS:
+        raise ValueError(
+            "No VAULT_USER_<GROUP>_* triples found -- at least one user must be "
+            "configured (VAULT_USER_<GROUP>_USERNAME/_PASSWORD/_TOKEN, e.g. "
+            "VAULT_USER_ALICE_USERNAME=alice) or every login will be rejected."
+        )
+
     if _INCOMPLETE_USER_GROUPS:
         raise ValueError(
             "Incomplete VAULT_USER_<GROUP>_* triple for: " +

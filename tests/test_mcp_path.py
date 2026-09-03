@@ -14,11 +14,19 @@ from obsidian_vault_mcp import auth, config, server
 
 
 def _reload(monkeypatch, value):
-    """Reload config (+auth, which snapshots the path) with VAULT_MCP_PATH set/unset."""
+    """Reload config (+auth, which snapshots the path) with VAULT_MCP_PATH set/unset.
+
+    Also ensures at least one VAULT_USER_<GROUP>_* triple is present -- validate_config()
+    now fails closed on zero configured users (see config._validate_users_have_tokens),
+    and this file's tests are exercising VAULT_MCP_PATH validation specifically, not that.
+    """
     if value is None:
         monkeypatch.delenv("VAULT_MCP_PATH", raising=False)
     else:
         monkeypatch.setenv("VAULT_MCP_PATH", value)
+    monkeypatch.setenv("VAULT_USER_TESTER_USERNAME", "tester")
+    monkeypatch.setenv("VAULT_USER_TESTER_PASSWORD", "test-password")
+    monkeypatch.setenv("VAULT_USER_TESTER_TOKEN", "test-token-12345")
     importlib.reload(config)
     importlib.reload(auth)
 
