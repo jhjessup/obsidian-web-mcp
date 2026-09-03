@@ -10,20 +10,43 @@ VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
 _USER_ENV_RE = re.compile(r"^VAULT_USER_(.+)_USERNAME$")
 
 
-def _load_users_from_env() -> tuple[dict[str, str], dict[str, str], list[str]]:
-    """Build (VAULT_OAUTH_USERS, VAULT_MCP_TOKENS, incomplete_groups) from one
-    env-var triple per user: VAULT_USER_<GROUP>_USERNAME / _PASSWORD / _TOKEN, where
-    <GROUP> is an arbitrary grouping key (not read or validated itself -- it only
-    ties the three vars for one person together; using the username itself,
-    uppercased, is the readable choice but any distinct string works).
+def _parse_roots(raw: str) -> list[tuple[str, str]]:
+    """Parse "prefix:bits,prefix2:bits2" (comma- or newline-separated) into raw
+    (prefix, bits) string tuples -- NOT validated or normalized here (this module
+    can't import permissions.py without cycling back into config; permissions.py
+    does that work at lookup time, and config._validate_user_roots does it at
+    startup via a function-local import, the same technique _validate_mcp_path
+    already uses to reach into auth.py without a top-level cycle).
+    """
+    pairs: list[tuple[str, str]] = []
+    for chunk in raw.replace("\n", ",").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        prefix, sep, bits = chunk.rpartition(":")
+        if not sep:
+            continue
+        pairs.append((prefix.strip(), bits.strip()))
+    return pairs
+
+
+def _load_users_from_env() -> tuple[dict[str, str], dict[str, str], dict[str, list[tuple[str, str]]], list[str]]:
+    """Build (VAULT_OAUTH_USERS, VAULT_MCP_TOKENS, VAULT_USER_ROOTS, incomplete_groups)
+    from one env-var group per user: VAULT_USER_<GROUP>_USERNAME / _PASSWORD / _TOKEN
+    (required) and _ROOTS (optional), where <GROUP> is an arbitrary grouping key (not
+    read or validated itself -- it only ties one person's vars together; using the
+    username itself, uppercased, is the readable choice but any distinct string works).
 
     Replaced the old single VAULT_OAUTH_USERS/VAULT_MCP_TOKENS multi-line blobs
     (each holding every user at once) with this per-user-triple shape specifically so
     each person's Kubernetes Secret can be independent -- adding, rotating, or
     removing one person's credentials no longer means regenerating a blob containing
-    everyone else's still-current lines too. A person's three env vars typically all
-    come from one Secret (via envFrom + a per-Secret `prefix:`), but nothing here
-    requires that -- this just scans whatever's in the environment.
+    everyone else's still-current lines too. A person's env vars typically all come
+    from one Secret (via envFrom + a per-Secret `prefix:`), but nothing here requires
+    that -- this just scans whatever's in the environment. _ROOTS is not secret and
+    could live in a ConfigMap instead, but keeping it alongside credentials in the
+    same per-person Secret is the lower-friction choice given envFrom+prefix is
+    already wired per Secret.
 
     incomplete_groups (a username set but its password or token missing) is
     returned rather than raised here, so every other config value still loads and
@@ -33,6 +56,7 @@ def _load_users_from_env() -> tuple[dict[str, str], dict[str, str], list[str]]:
     """
     users: dict[str, str] = {}
     tokens: dict[str, str] = {}
+    roots: dict[str, list[tuple[str, str]]] = {}
     incomplete: list[str] = []
 
     for key in os.environ:
@@ -50,11 +74,50 @@ def _load_users_from_env() -> tuple[dict[str, str], dict[str, str], list[str]]:
             continue
         users[username] = password
         tokens[username] = token
+        roots_raw = os.environ.get(f"VAULT_USER_{group}_ROOTS", "").strip()
+        if roots_raw:
+            roots[username] = _parse_roots(roots_raw)
 
-    return users, tokens, sorted(incomplete)
+    return users, tokens, roots, sorted(incomplete)
 
 
-VAULT_OAUTH_USERS, VAULT_MCP_TOKENS, _INCOMPLETE_USER_GROUPS = _load_users_from_env()
+VAULT_OAUTH_USERS, VAULT_MCP_TOKENS, _VAULT_USER_ROOTS_EXPLICIT, _INCOMPLETE_USER_GROUPS = _load_users_from_env()
+
+# Applied to any configured user with no explicit VAULT_USER_<GROUP>_ROOTS, so the
+# common "everyone gets rw on the whole vault, then carve out exceptions with
+# VAULT_USER_<GROUP>_ROOTS" deployment doesn't need one identical _ROOTS entry
+# repeated in every person's Secret. Same "prefix:bits,..." shape; "" (root)
+# defaulting to "rw" (i.e. VAULT_DEFAULT_ROOTS unset) matches this server's
+# pre-permissions behavior for anyone who doesn't get an explicit override.
+VAULT_DEFAULT_ROOTS = _parse_roots(os.environ.get("VAULT_DEFAULT_ROOTS", ":rw"))
+
+# Only takes effect when VAULT_PERMISSIONS_ENABLED is set (see below) -- until
+# then every user's effective roots are irrelevant, since permissions.py's
+# effective_bits() short-circuits to full access.
+VAULT_USER_ROOTS: dict[str, list[tuple[str, str]]] = {
+    username: _VAULT_USER_ROOTS_EXPLICIT.get(username, VAULT_DEFAULT_ROOTS)
+    for username in VAULT_OAUTH_USERS
+}
+
+# Gates ALL per-path permission enforcement (permissions.py) and the vault_share/
+# vault_unshare/vault_shares tools. Off by default: this server has always given
+# every logged-in user the whole vault, and flipping this on without every user
+# having a deliberate VAULT_USER_<GROUP>_ROOTS (or accepting VAULT_DEFAULT_ROOTS)
+# would silently change that -- see permissions.py's module docstring. Accepts
+# 1/true/yes/on (case-insensitive), matching VAULT_AUDIT_LOG_INCLUDE_READS below.
+VAULT_PERMISSIONS_ENABLED = os.environ.get(
+    "VAULT_PERMISSIONS_ENABLED", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+# Where runtime vault_share/vault_unshare grants are persisted (permissions.py).
+# Same directory as OAUTH_CLIENTS_PATH below and for the same reason: in-memory-only
+# state doesn't survive a restart, and in k8s that directory must already be backed
+# by a PersistentVolume for the OAuth client registry to work, so shares get
+# durability for free with no new volume required.
+VAULT_SHARES_PATH = Path(os.environ.get(
+    "VAULT_SHARES_PATH",
+    Path.home() / ".local" / "share" / "vault-mcp" / "shares.json",
+))
 
 # Daily-note tools. FOLDER "" means the vault root; FORMAT/TEMPLATE are strftime
 # patterns. All optional with safe defaults; resolved paths still go through
@@ -292,6 +355,59 @@ def _validate_users_have_tokens() -> None:
         )
 
 
+def _validate_user_roots() -> None:
+    """Every configured root/share prefix and bits must actually parse, and (when
+    permissions are enabled) every user must have at least one root -- a user with
+    zero roots can do literally nothing, which is far more likely a missing Secret
+    key than an operator's actual intent, so it fails startup rather than silently
+    locking that person out.
+    """
+    # Imported lazily: permissions.py imports config, so a top-level import here
+    # would cycle -- same technique _validate_mcp_path uses for auth.py.
+    from . import permissions
+
+    bad: list[str] = []
+    for username, entries in VAULT_USER_ROOTS.items():
+        if VAULT_PERMISSIONS_ENABLED and not entries:
+            bad.append(f"{username} (no roots at all)")
+            continue
+        for prefix, bits in entries:
+            try:
+                permissions.normalize_prefix(prefix)
+                permissions.bits_from_str(bits)
+            except ValueError as e:
+                bad.append(f"{username} ({prefix!r}:{bits!r}: {e})")
+
+    if bad:
+        raise ValueError(
+            "Invalid VAULT_USER_<GROUP>_ROOTS / VAULT_DEFAULT_ROOTS entries: " +
+            "; ".join(bad)
+        )
+
+
+def _validate_shares_path_outside_vault() -> None:
+    """Reject a VAULT_SHARES_PATH that resolves inside the vault.
+
+    Same reasoning as audit.audit_path_inside_vault(): a share registry the vault
+    tools can themselves read or overwrite (via vault_write/vault_delete) turns
+    "share a path with yourself with full bits" into a privilege-escalation
+    primitive. Only checked when permissions are enabled -- the file isn't even
+    read or written otherwise.
+    """
+    if not VAULT_PERMISSIONS_ENABLED:
+        return
+    try:
+        shares_path = VAULT_SHARES_PATH.resolve()
+        vault = VAULT_PATH.resolve()
+    except OSError:
+        return
+    if shares_path == vault or vault in shares_path.parents:
+        raise ValueError(
+            f"VAULT_SHARES_PATH resolves inside the vault ({shares_path}); the vault "
+            "tools could rewrite it. Choose a path outside VAULT_PATH."
+        )
+
+
 def validate_config() -> None:
     """Validate operator-supplied configuration at startup.
 
@@ -300,3 +416,5 @@ def validate_config() -> None:
     """
     _validate_mcp_path(VAULT_MCP_PATH)
     _validate_users_have_tokens()
+    _validate_user_roots()
+    _validate_shares_path_outside_vault()

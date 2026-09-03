@@ -16,7 +16,8 @@ from pathlib import Path
 
 import frontmatter
 
-from .. import config
+from .. import config, permissions
+from ..context import current_request_context
 from ..serialization import dumps
 from ..vault import resolve_vault_path
 
@@ -34,15 +35,36 @@ def _vault_root() -> Path:
     return config.VAULT_PATH.resolve()
 
 
+def _check_analytics_permission(path_prefix: str) -> None:
+    """Raise PermissionDenied unless the current user can read something at or
+    under path_prefix. Mirrors list_directory's precondition (vault.py) -- an
+    analytics call over a wholly-denied prefix must fail outright rather than
+    quietly report zero findings, which would be indistinguishable from a
+    genuinely clean vault."""
+    if not config.VAULT_PERMISSIONS_ENABLED:
+        return
+    username = current_request_context().get("username")
+    if not permissions.has_readable_descendant(username, path_prefix):
+        raise permissions.PermissionDenied("Permission denied")
+
+
 def _iter_vault_files(path_prefix: str = "", pattern: str = "*") -> list[Path]:
-    """Walk the vault (or a sub-prefix) yielding non-excluded, real files.
+    """Walk the vault (or a sub-prefix) yielding non-excluded, real, readable files.
 
     ``resolve_vault_path`` enforces the traversal/dotfile/null-byte guard; an
-    empty prefix walks the whole vault from its root.
+    empty prefix walks the whole vault from its root. Every yielded file is
+    additionally gated by ``permissions.can_read`` for the current request's
+    user, so a file this user can't read never feeds any analytics finding --
+    not even indirectly, e.g. as a wikilink resolution target or a tag-variant
+    source.
     """
     root = resolve_vault_path(path_prefix) if path_prefix else _vault_root()
     if not root.is_dir():
         raise NotADirectoryError(f"Not a directory: {path_prefix}")
+
+    vault_root = _vault_root()
+    username = current_request_context().get("username")
+    permissions_enabled = config.VAULT_PERMISSIONS_ENABLED
 
     files: list[Path] = []
     for path in root.rglob(pattern):
@@ -50,6 +72,10 @@ def _iter_vault_files(path_prefix: str = "", pattern: str = "*") -> list[Path]:
             continue
         if path.is_symlink() or not path.is_file():
             continue
+        if permissions_enabled:
+            rel = str(path.relative_to(vault_root)).replace("\\", "/")
+            if not permissions.can_read(username, rel):
+                continue
         files.append(path)
     return files
 
@@ -344,6 +370,7 @@ def vault_analytics_summary(
 ) -> str:
     """Return a compact analytics summary for vault hygiene."""
     try:
+        _check_analytics_permission(path_prefix)
         posts, basename_index, path_index = _load_posts(path_prefix)
         encoding_issues = _scan_encoding_issues(path_prefix, max_results=1000)
         oversized = _oversized_files(path_prefix, max_results=1000)
@@ -392,6 +419,7 @@ def vault_analytics_findings(
 ) -> str:
     """Return detailed findings for one analytics category."""
     try:
+        _check_analytics_permission(path_prefix)
         posts, basename_index, path_index = _load_posts(path_prefix)
         required_frontmatter = required_frontmatter or []
         category_map = {

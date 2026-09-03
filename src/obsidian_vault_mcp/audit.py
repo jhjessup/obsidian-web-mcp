@@ -57,6 +57,11 @@ READ_OPERATIONS = {
 # Mutations whose result reports per-file outcomes; audited one record per file.
 BATCH_OPERATIONS = {"vault_batch_frontmatter_update"}
 
+# Sharing/unsharing a vault path is security-relevant even though it doesn't touch
+# file content -- always audited, same as MUTATION_OPERATIONS, never gated behind
+# VAULT_AUDIT_LOG_INCLUDE_READS.
+SHARE_OPERATIONS = {"vault_share", "vault_unshare"}
+
 
 def audit_enabled() -> bool:
     """True when append-only audit logging is configured."""
@@ -76,7 +81,7 @@ def should_audit_operation(operation: str) -> bool:
     """
     if not audit_enabled():
         return False
-    return operation in MUTATION_OPERATIONS or (
+    return operation in MUTATION_OPERATIONS or operation in SHARE_OPERATIONS or (
         operation in READ_OPERATIONS and read_audit_enabled()
     )
 
@@ -191,8 +196,14 @@ def build_audit_record(
     after: dict[str, Any] | None = None,
     operation_status: str = "success",
     error: str | None = None,
+    details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build one normalized audit record from the current request context."""
+    """Build one normalized audit record from the current request context.
+
+    `details` carries operation-specific fields that don't fit the generic
+    before/after-checksum shape (e.g. the grantor/subject/bits of a share
+    operation, which has no file content to snapshot).
+    """
     ctx = current_request_context()
     before = before or {"size": None, "checksum": None}
     after = after or {"size": None, "checksum": None}
@@ -210,7 +221,35 @@ def build_audit_record(
         "request_id": ctx.get("request_id") or uuid.uuid4().hex,
         "operation_status": operation_status,
         "error": error,
+        "details": details,
     }
+
+
+def write_denial_record(
+    path: str, need: str, effective_bits: str, *, operation: str | None = None
+) -> None:
+    """Best-effort audit record for a permission denial.
+
+    Called from permissions.enforce() on every denied request, independent of
+    VAULT_AUDIT_LOG_INCLUDE_READS -- a denial is a security-relevant event in its
+    own right, not a read, so it's not gated behind the read-audit toggle. Like
+    write_audit_record, a logging failure here must never surface to the caller
+    or affect the PermissionDenied/FileNotFoundError already being raised by
+    enforce().
+    """
+    if not audit_enabled():
+        return
+    try:
+        record = build_audit_record(
+            operation=operation or "permission_check",
+            target_path=path,
+            operation_status="denied",
+            error="Permission denied",
+            details={"need": need, "effective_bits": effective_bits},
+        )
+        write_audit_record(record)
+    except Exception as exc:
+        logger.error("Audit denial record failed: %s", exc)
 
 
 def write_audit_record(record: dict[str, Any]) -> bool:

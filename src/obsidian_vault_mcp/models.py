@@ -503,3 +503,43 @@ class VaultAnalyticsFindingsInput(BaseModel):
         le=200,
         description="Maximum number of findings to return",
     )
+
+
+class VaultShareInput(BaseModel):
+    """Grant another user access to a vault path prefix."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Vault-relative path prefix to share (e.g. '' for the whole vault, or 'projects/acme')",
+        max_length=500,
+    )
+    user: str = Field(
+        ...,
+        description="Username to share with; must be a user already known to this server",
+        min_length=1,
+        max_length=100,
+    )
+    access: Literal["r", "rw"] = Field(
+        ...,
+        description="Access level to grant: 'r' for read-only, 'rw' for read-write",
+    )
+
+
+class VaultUnshareInput(BaseModel):
+    """Revoke a previously granted share."""
+
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    path: str = Field(
+        ...,
+        description="Vault-relative path prefix of the share to revoke",
+        max_length=500,
+    )
+    user: str = Field(
+        ...,
+        description="Username the share was granted to",
+        min_length=1,
+        max_length=100,
+    )

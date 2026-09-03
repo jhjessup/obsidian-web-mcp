@@ -7,14 +7,23 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config
+from . import config, context, permissions
 
 
-def resolve_vault_path(relative_path: str) -> Path:
+def resolve_vault_path(relative_path: str, *, require: str | None = None) -> Path:
     """Resolve a relative path against the vault root, with safety checks.
 
     Raises ValueError if the path escapes the vault, contains null bytes,
     or touches dotfile/dot-directory components.
+
+    require=None (the default) performs ONLY the path-safety checks above --
+    this is the mode audit.snapshot_path() uses, since it resolves paths as the
+    server itself (checksumming before/after a mutation), not as the requesting
+    user, and must never be denied by that user's own permissions. Pass
+    require="r" or require="w" to additionally enforce the current request's
+    permissions (permissions.py) for that path; see permissions.py's module
+    docstring for what "current request" means outside a real request (nothing
+    is granted).
     """
     if "\x00" in relative_path:
         raise ValueError("Path contains null bytes")
@@ -33,6 +42,9 @@ def resolve_vault_path(relative_path: str) -> Path:
     if not str(resolved).startswith(str(vault_root) + os.sep) and resolved != vault_root:
         raise ValueError("Path resolves outside the vault root")
 
+    if require is not None:
+        permissions.enforce(relative_path, require)
+
     return resolved
 
 
@@ -46,7 +58,7 @@ def read_file(relative_path: str) -> tuple[str, dict]:
 
     Metadata keys: size (int), modified (ISO str), created (ISO str).
     """
-    path = resolve_vault_path(relative_path)
+    path = resolve_vault_path(relative_path, require="r")
 
     if not path.is_file():
         raise FileNotFoundError(f"Not a file: {relative_path}")
@@ -77,7 +89,7 @@ def write_file_atomic(
             f"Content size {len(encoded)} bytes exceeds limit of {config.MAX_CONTENT_SIZE} bytes"
         )
 
-    path = resolve_vault_path(relative_path)
+    path = resolve_vault_path(relative_path, require="w")
     is_new = not path.exists()
 
     if create_dirs:
@@ -118,7 +130,7 @@ def write_bytes_atomic(
             f"Content size {len(content)} bytes exceeds limit of {config.MAX_BINARY_SIZE} bytes"
         )
 
-    path = resolve_vault_path(relative_path)
+    path = resolve_vault_path(relative_path, require="w")
     is_new = not path.exists()
 
     if create_dirs:
@@ -162,8 +174,11 @@ def move_path(
     Both paths are relative to the vault root. Raises if the destination
     already exists.
     """
-    src = resolve_vault_path(source)
-    dst = resolve_vault_path(destination)
+    # A move deletes the source, so it needs "w" there too -- read alone isn't
+    # enough to authorize removing it, even though move_path itself never reads
+    # the source's content.
+    src = resolve_vault_path(source, require="w")
+    dst = resolve_vault_path(destination, require="w")
 
     if not src.exists():
         raise FileNotFoundError(f"Source does not exist: {source}")
@@ -183,7 +198,7 @@ def delete_path(relative_path: str) -> bool:
 
     Refuses to delete non-empty directories.
     """
-    path = resolve_vault_path(relative_path)
+    path = resolve_vault_path(relative_path, require="w")
 
     if not path.exists():
         raise FileNotFoundError(f"Path does not exist: {relative_path}")
@@ -219,6 +234,14 @@ def list_directory(
     """
     depth = min(depth, config.MAX_LIST_DEPTH)
 
+    # Precondition, not a per-entry check: without at least one readable path at
+    # or under relative_path, this call has nothing to show -- deny it outright
+    # rather than silently returning an empty list, which would be indistinguishable
+    # from "this directory happens to be empty".
+    username = context.current_request_context().get("username")
+    if not permissions.has_readable_descendant(username, relative_path):
+        raise permissions.PermissionDenied("Permission denied")
+
     root = resolve_vault_path(relative_path)
     if not root.is_dir():
         raise NotADirectoryError(f"Not a directory: {relative_path}")
@@ -241,6 +264,22 @@ def list_directory(
                 continue
 
             is_dir = entry.is_dir()
+            rel = str(entry.relative_to(vault_root))
+
+            # Permission gate, computed once per entry regardless of the
+            # include_dirs/include_files/pattern filters below: a directory this
+            # user can't read AND has no readable descendant under is fully
+            # hidden -- no row, no recursion, so its very existence doesn't leak
+            # through a listing the way it would if we merely skipped emitting a
+            # row but still walked into it. A file this user can't read is
+            # likewise invisible, not merely un-openable.
+            readable = permissions.can_read(username, rel)
+            if is_dir:
+                can_descend = readable or permissions.has_readable_descendant(username, rel)
+                if not can_descend:
+                    continue
+            elif not readable:
+                continue
 
             if is_dir and not include_dirs:
                 # Still recurse even if we're not listing dirs
@@ -256,12 +295,17 @@ def list_directory(
                     _walk(entry, current_depth + 1)
                 continue
 
+            # A directory the user can descend into (readable descendant below)
+            # but can't itself read gets recursed into with no row emitted for
+            # it -- this is the case a plain "readable" gate would miss.
+            if is_dir and not readable:
+                _walk(entry, current_depth + 1)
+                continue
+
             try:
                 stat = entry.stat()
             except OSError:
                 continue
-
-            rel = str(entry.relative_to(vault_root))
 
             results.append({
                 "name": entry.name,

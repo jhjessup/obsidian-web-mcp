@@ -32,6 +32,7 @@ from .frontmatter_index import FrontmatterIndex
 from .audit import (
     BATCH_OPERATIONS,
     MUTATION_OPERATIONS,
+    SHARE_OPERATIONS,
     audit_enabled,
     audit_log_path,
     audit_path_inside_vault,
@@ -161,6 +162,11 @@ from .tools.analytics import (
     vault_analytics_summary as _vault_analytics_summary,
     vault_analytics_findings as _vault_analytics_findings,
 )
+from .tools.sharing import (
+    vault_share as _vault_share,
+    vault_unshare as _vault_unshare,
+    vault_shares as _vault_shares,
+)
 from .models import (
     VaultReadInput,
     VaultWriteInput,
@@ -180,6 +186,8 @@ from .models import (
     VaultDailyNoteAppendInput,
     VaultAnalyticsSummaryInput,
     VaultAnalyticsFindingsInput,
+    VaultShareInput,
+    VaultUnshareInput,
 )
 
 
@@ -207,6 +215,9 @@ def _run_audited(operation: str, func, **context) -> str:
 
     if operation in BATCH_OPERATIONS:
         return _run_audited_batch(operation, func, context)
+
+    if operation in SHARE_OPERATIONS:
+        return _run_audited_share(operation, func, context)
 
     is_mutation = operation in MUTATION_OPERATIONS
     before = snapshot_path(before_target_path(operation, context)) if is_mutation else None
@@ -238,6 +249,40 @@ def _run_audited(operation: str, func, **context) -> str:
             before=snapshot_path(target_path), operation_status=status, error=error,
         )
     write_audit_record(record)
+    return result
+
+
+def _run_audited_share(operation: str, func, context: dict) -> str:
+    """Audit a vault_share/vault_unshare call.
+
+    A share grant has no file content of its own to checksum -- before/after
+    snapshotting (built for vault_write's "did the bytes change" question)
+    doesn't apply here. target_path is the share's path prefix; the
+    user/access being granted or revoked go in details instead, since they're
+    intrinsic to what happened, not incidental context the way a mutation's
+    create_dirs flag is.
+    """
+    target_path = context.get("path")
+    details = {"user": context.get("user")}
+    if "access" in context:
+        details["access"] = context.get("access")
+
+    try:
+        result = func()
+    except Exception:
+        write_audit_record(build_audit_record(
+            operation=operation, target_path=target_path,
+            operation_status="error", error="tool exception", details=details,
+        ))
+        raise
+
+    parsed = _parse_tool_result(result)
+    status = "error" if "error" in parsed else "success"
+    error = parsed.get("error") if status == "error" else None
+    write_audit_record(build_audit_record(
+        operation=operation, target_path=target_path,
+        operation_status=status, error=error, details=details,
+    ))
     return result
 
 
@@ -615,6 +660,53 @@ def vault_analytics_findings(
         inp.required_frontmatter,
         inp.max_results,
     )
+
+
+@mcp.tool(
+    name="vault_share",
+    description=(
+        "Grant another known user read ('r') or read-write ('rw') access to a vault path prefix. "
+        "You can only grant access you yourself hold there. No-ops with an error if permissions "
+        "are not enabled on this server."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_share(path: str, user: str, access: str) -> str:
+    """Grant another user access to a vault path prefix."""
+    inp = VaultShareInput(path=path, user=user, access=access)
+    return _run_audited(
+        "vault_share",
+        lambda: _vault_share(inp.path, inp.user, inp.access),
+        path=inp.path, user=inp.user, access=inp.access,
+    )
+
+
+@mcp.tool(
+    name="vault_unshare",
+    description=(
+        "Revoke a share you previously granted at a vault path prefix, cascading to any share "
+        "derived from it. Only the original grantor can revoke it."
+    ),
+    annotations={"readOnlyHint": False, "destructiveHint": True, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_unshare(path: str, user: str) -> str:
+    """Revoke a share this user previously granted."""
+    inp = VaultUnshareInput(path=path, user=user)
+    return _run_audited(
+        "vault_unshare",
+        lambda: _vault_unshare(inp.path, inp.user),
+        path=inp.path, user=inp.user,
+    )
+
+
+@mcp.tool(
+    name="vault_shares",
+    description="List every share you've granted to others and every share others have granted to you.",
+    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+)
+def vault_shares() -> str:
+    """List shares granted by and to the current user."""
+    return _vault_shares()
 
 
 def build_app(extensions=()):

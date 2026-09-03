@@ -1,5 +1,6 @@
 """Search tools for the Obsidian vault MCP server."""
 
+import fnmatch
 import json
 import logging
 import shutil
@@ -8,11 +9,20 @@ from pathlib import Path
 
 import frontmatter
 
-from .. import config
+from .. import config, permissions
+from ..context import current_request_context
 from ..serialization import dumps
 from ..vault import resolve_vault_path
 
 logger = logging.getLogger(__name__)
+
+# vault_search over-fetches this multiple of max_results from the underlying
+# ripgrep/Python search before permission-filtering, so that denied matches
+# don't silently eat into the caller's requested result count -- without this,
+# a user with a narrow grant inside a broadly-searched tree could see fewer
+# results than max_results even though more real matches exist deeper in
+# their own readable area, indistinguishable from "there just aren't more".
+_SEARCH_OVERFETCH_FACTOR = 5
 
 
 def _search_ripgrep(
@@ -87,8 +97,6 @@ def _search_python(
     context_lines: int,
 ) -> list[dict]:
     """Fallback Python-based search."""
-    import fnmatch
-
     query_lower = query.lower()
     matches = []
 
@@ -131,6 +139,43 @@ def _search_python(
     return matches
 
 
+def _search_single_file(
+    file_path: Path, query: str, max_results: int, context_lines: int
+) -> list[dict]:
+    """Search one file directly, for a readable root that's a single file rather
+    than a directory (permissions.readable_roots() can return either -- a share
+    or config root can name an exact file, e.g. one shared note rather than a
+    whole folder). rglob-based directory search would never visit such a path on
+    its own since it isn't itself a directory to walk."""
+    if not file_path.is_file():
+        return []
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, PermissionError, OSError):
+        return []
+
+    try:
+        rel_path = str(file_path.relative_to(config.VAULT_PATH))
+    except ValueError:
+        return []
+
+    query_lower = query.lower()
+    lines = content.splitlines()
+    matches = []
+    for i, line in enumerate(lines):
+        if query_lower in line.lower():
+            start = max(0, i - context_lines)
+            end = min(len(lines), i + context_lines + 1)
+            matches.append({
+                "path": rel_path,
+                "line_number": i + 1,
+                "match_context": "\n".join(lines[start:end]),
+            })
+            if len(matches) >= max_results:
+                break
+    return matches
+
+
 def _get_frontmatter_excerpt(file_path: Path, max_keys: int = 3) -> dict | None:
     """Read frontmatter from a file, returning first N key-value pairs."""
     try:
@@ -153,24 +198,51 @@ def vault_search(
 ) -> str:
     """Search for text across vault files."""
     try:
+        username = current_request_context().get("username")
+
         if path_prefix:
+            if config.VAULT_PERMISSIONS_ENABLED and not permissions.has_readable_descendant(
+                username, path_prefix
+            ):
+                return dumps({"error": "Permission denied"})
             search_path = resolve_vault_path(path_prefix)
+            if not search_path.is_dir():
+                return dumps({"error": f"Search path is not a directory: {path_prefix}"})
+            search_roots = [search_path]
         else:
-            search_path = config.VAULT_PATH
+            if config.VAULT_PERMISSIONS_ENABLED:
+                roots = permissions.readable_roots(username)
+                if not roots:
+                    return dumps({"error": "Permission denied"})
+                search_roots = [resolve_vault_path(r) if r else config.VAULT_PATH for r in roots]
+            else:
+                search_roots = [config.VAULT_PATH]
 
-        if not search_path.is_dir():
-            return dumps({"error": f"Search path is not a directory: {path_prefix}"})
+        # Fetch more than max_results per root, since the permission post-filter
+        # below (a backstop for grants/carve-outs nested *inside* a readable
+        # root, e.g. a deny sub-prefix) may drop some -- see _SEARCH_OVERFETCH_FACTOR.
+        fetch_limit = max_results * _SEARCH_OVERFETCH_FACTOR
 
-        if shutil.which("rg"):
-            matches = _search_ripgrep(query, search_path, file_pattern, max_results, context_lines)
-        else:
-            matches = _search_python(query, search_path, file_pattern, max_results, context_lines)
+        all_matches: list[dict] = []
+        for root_path in search_roots:
+            if root_path.is_dir():
+                if shutil.which("rg"):
+                    found = _search_ripgrep(query, root_path, file_pattern, fetch_limit, context_lines)
+                else:
+                    found = _search_python(query, root_path, file_pattern, fetch_limit, context_lines)
+                all_matches.extend(found)
+            elif root_path.is_file() and fnmatch.fnmatch(root_path.name, file_pattern):
+                all_matches.extend(_search_single_file(root_path, query, fetch_limit, context_lines))
+
+        if config.VAULT_PERMISSIONS_ENABLED:
+            all_matches = [m for m in all_matches if permissions.can_read(username, m["path"])]
+
+        truncated = len(all_matches) > max_results
+        matches = all_matches[:max_results]
 
         for match in matches:
             file_full_path = config.VAULT_PATH / match["path"]
             match["frontmatter_excerpt"] = _get_frontmatter_excerpt(file_full_path)
-
-        truncated = len(matches) >= max_results
 
         return dumps({
             "results": matches,
@@ -195,12 +267,24 @@ def vault_search_frontmatter(
     from ..server import frontmatter_index
 
     try:
+        username = current_request_context().get("username")
+
+        if (
+            path_prefix
+            and config.VAULT_PERMISSIONS_ENABLED
+            and not permissions.has_readable_descendant(username, path_prefix)
+        ):
+            return dumps({"error": "Permission denied"})
+
         results = frontmatter_index.search_by_field(
             field=field,
             value=value,
             match_type=match_type,
             path_prefix=path_prefix,
         )
+
+        if config.VAULT_PERMISSIONS_ENABLED:
+            results = [r for r in results if permissions.can_read(username, r["path"])]
 
         formatted = []
         for item in results[:max_results]:
