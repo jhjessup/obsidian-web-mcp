@@ -12,7 +12,7 @@ import obsidian_vault_mcp.context as context
 import obsidian_vault_mcp.permissions as permissions
 from obsidian_vault_mcp.tools.search import vault_search
 from obsidian_vault_mcp.tools.sharing import vault_share, vault_shares, vault_unshare
-from obsidian_vault_mcp.vault import list_directory
+from obsidian_vault_mcp.vault import list_directory, read_file, write_file_atomic
 
 
 @contextmanager
@@ -259,3 +259,110 @@ def test_vault_unshare_unknown_share_reports_not_found(monkeypatch):
     with _as_user("alice"):
         result = json.loads(vault_unshare("docs", "bob"))
     assert "No share found" in result["error"]
+
+
+# --- permissions.scope_path / home_root: auto-prefix into a user's own root -
+
+def test_home_root_is_first_configured_root(monkeypatch):
+    _enable(monkeypatch, user_roots={"alice": [("alice", "rw"), ("shared", "r")]})
+    assert permissions.home_root("alice") == "alice"
+
+
+def test_home_root_none_without_permissions_or_username(monkeypatch):
+    monkeypatch.setattr(config, "VAULT_PERMISSIONS_ENABLED", False)
+    assert permissions.home_root("alice") is None
+    _enable(monkeypatch, user_roots={"alice": [("alice", "rw")]})
+    assert permissions.home_root(None) is None
+
+
+def test_scope_path_prefixes_inaccessible_path_under_home_root(monkeypatch):
+    _enable(monkeypatch, user_roots={"alice": [("alice", "rw")]})
+    assert permissions.scope_path("alice", "note.md", frozenset("w")) == "alice/note.md"
+    assert permissions.scope_path("alice", "", frozenset("r")) == "alice"
+
+
+def test_scope_path_leaves_already_accessible_path_unchanged(monkeypatch):
+    """A path already valid as given -- the user's own root, or something
+    shared with them under a different prefix -- must never be double-prefixed."""
+    _enable(monkeypatch, user_roots={"alice": [("alice", "rw")]})
+    permissions.grant_share(granter="bob", subject="alice", prefix="bob-shared", bits=frozenset("r"))
+
+    assert permissions.scope_path("alice", "alice/note.md", frozenset("w")) == "alice/note.md"
+    assert permissions.scope_path("alice", "bob-shared/x.md", frozenset("r")) == "bob-shared/x.md"
+
+
+def test_scope_path_gives_up_honestly_when_home_prefix_still_lacks_bits(monkeypatch):
+    """If prefixing with home still doesn't grant `need` (e.g. a read-only
+    home but a write was requested), return the path unchanged so the normal
+    enforcement path raises its own honest denial -- never mask one denial
+    reason with a different, confusing one."""
+    _enable(monkeypatch, user_roots={"alice": [("alice", "r")]})
+    assert permissions.scope_path("alice", "note.md", frozenset("w")) == "note.md"
+
+
+def test_scope_path_noop_when_permissions_disabled(monkeypatch):
+    monkeypatch.setattr(config, "VAULT_PERMISSIONS_ENABLED", False)
+    assert permissions.scope_path("alice", "note.md", frozenset("w")) == "note.md"
+
+
+# --- integration: a bare filename actually lands in the user's own root ----
+
+def test_write_file_auto_scopes_into_users_home_root(monkeypatch, vault_dir):
+    _enable(monkeypatch, user_roots={"alice": [("alice", "rw")]})
+    with _as_user("alice"):
+        write_file_atomic("note.md", "hello from alice")
+        content, _ = read_file("note.md")
+    assert content == "hello from alice"
+    assert (vault_dir / "alice" / "note.md").read_text() == "hello from alice"
+    assert not (vault_dir / "note.md").exists()
+
+
+def test_write_file_does_not_double_prefix_an_already_rooted_path(monkeypatch, vault_dir):
+    _enable(monkeypatch, user_roots={"alice": [("alice", "rw")]})
+    with _as_user("alice"):
+        write_file_atomic("alice/note.md", "hello")
+    assert (vault_dir / "alice" / "note.md").read_text() == "hello"
+    assert not (vault_dir / "alice" / "alice" / "note.md").exists()
+
+
+def test_write_file_auto_scope_never_escapes_into_another_users_real_root(monkeypatch, vault_dir):
+    """A path that happens to start with another user's root name, but was
+    never shared, gets nested under the WRITER's own root (a subfolder that
+    merely happens to be named "bob") -- it must never actually reach bob's
+    real files, since scope_path only ever prepends the caller's own home,
+    so the rewritten candidate is always confined under that home."""
+    (vault_dir / "bob").mkdir()
+    (vault_dir / "bob" / "secret.md").write_text("bob's real secret")
+    _enable(monkeypatch, user_roots={
+        "alice": [("alice", "rw")],
+        "bob": [("bob", "rw")],
+    })
+    with _as_user("alice"):
+        write_file_atomic("bob/secret.md", "alice's note, unrelated to bob's file")
+        content, _ = read_file("bob/secret.md")
+    assert content == "alice's note, unrelated to bob's file"
+    # Landed under alice's own root as a nested "bob" folder, not bob's real one.
+    assert (vault_dir / "alice" / "bob" / "secret.md").read_text() == "alice's note, unrelated to bob's file"
+    assert (vault_dir / "bob" / "secret.md").read_text() == "bob's real secret"
+
+
+# --- vault_share: the grantor's own path also gets auto-scoped -------------
+
+def test_vault_share_auto_scopes_under_grantors_home(monkeypatch):
+    _enable(monkeypatch, user_roots={"alice": [("alice", "rw")]})
+    monkeypatch.setattr(config, "VAULT_OAUTH_USERS", {"alice": "x", "bob": "y"})
+    with _as_user("alice"):
+        shared = json.loads(vault_share("Recipes", "bob", "r"))
+    assert shared["path"] == "alice/Recipes"
+    assert permissions.can_read("bob", "alice/Recipes/pasta.md")
+
+
+def test_vault_unshare_finds_share_via_home_prefix_fallback(monkeypatch):
+    _enable(monkeypatch, user_roots={"alice": [("alice", "rw")]})
+    monkeypatch.setattr(config, "VAULT_OAUTH_USERS", {"alice": "x", "bob": "y"})
+    with _as_user("alice"):
+        json.loads(vault_share("Recipes", "bob", "r"))
+        result = json.loads(vault_unshare("Recipes", "bob"))
+    assert result["revoked"] is True
+    assert result["path"] == "alice/Recipes"
+    assert permissions.find_share(subject="bob", prefix="alice/Recipes") is None

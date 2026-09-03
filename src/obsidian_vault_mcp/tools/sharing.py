@@ -52,13 +52,21 @@ def vault_share(path: str, user: str, access: str) -> str:
             return dumps({"error": f"Unknown user: {user}"})
 
         try:
-            prefix = permissions.normalize_prefix(path)
             bits = permissions.bits_from_str(access)
         except ValueError as e:
             return dumps({"error": str(e)})
 
         if not bits:
             return dumps({"error": "access must be 'r' or 'rw' (use vault_unshare to revoke)"})
+
+        # Transparently retry under the grantor's own root first -- see
+        # permissions.scope_path -- so jhjessup can share "Recipes" and have
+        # it resolve to "jhjessup/Recipes" without typing his own root's name,
+        # the same convenience every other path-taking tool gets.
+        try:
+            prefix = permissions.normalize_prefix(permissions.scope_path(grantor, path, bits))
+        except ValueError as e:
+            return dumps({"error": str(e)})
 
         # A grantor can only hand out bits they themselves hold at this exact
         # prefix -- effective_bits already applies the longest-prefix-match rule,
@@ -107,7 +115,20 @@ def vault_unshare(path: str, user: str) -> str:
         except ValueError as e:
             return dumps({"error": str(e)})
 
+        # vault_share transparently rescopes an unprefixed path under the
+        # grantor's own root (e.g. "Recipes" -> "jhjessup/Recipes"); mirror
+        # that here so revoking with the same unprefixed name the grantor
+        # originally used finds the same grant, without guessing which form
+        # was actually stored by trying to re-derive scope_path's own bits
+        # check (which needs bits this lookup doesn't have).
         existing = permissions.find_share(subject=user, prefix=prefix)
+        if existing is None:
+            home = permissions.home_root(grantor)
+            if home is not None:
+                rescoped = home if not prefix else f"{home}/{prefix}"
+                existing = permissions.find_share(subject=user, prefix=rescoped)
+                if existing is not None:
+                    prefix = rescoped
         if existing is None:
             return dumps({"error": f"No share found for {user!r} at {prefix!r}"})
 

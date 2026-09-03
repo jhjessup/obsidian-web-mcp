@@ -214,6 +214,62 @@ def readable_roots(username: str | None) -> list[str]:
     return roots
 
 
+def home_root(username: str | None) -> str | None:
+    """A user's own root -- the first entry of their VAULT_USER_<GROUP>_ROOTS --
+    or None if they have no configured root (or permissions are disabled). This
+    is the prefix scope_path() falls back to for an otherwise-inaccessible path,
+    so a user never has to know or type their own root's name."""
+    if not config.VAULT_PERMISSIONS_ENABLED or not username:
+        return None
+    entries = config.VAULT_USER_ROOTS.get(username) or ()
+    if not entries:
+        return None
+    try:
+        return normalize_prefix(entries[0][0])
+    except ValueError:
+        return None
+
+
+def scope_path(username: str | None, rel_path: str, need: Bits) -> str:
+    """Transparently resolve `rel_path` against the user's own root when the
+    path as given isn't already accessible, so "note.md" lands in a user's own
+    space without them ever needing to type or know their root's name.
+
+    A path that's already accessible as given -- the user's own root, an
+    explicit subpath of it, or something shared with them under a different
+    prefix entirely -- is returned unchanged; this only ever adds a prefix, it
+    never strips or rewrites an already-valid path, so a shared path is never
+    double-prefixed into the wrong place. If prefixing with the home root
+    still doesn't grant `need` (e.g. their root is read-only and `need`
+    includes write), the original path is returned unchanged so the caller's
+    own enforcement produces the normal, honest denial for what the user
+    actually typed -- this function only ever helps, it never hides or
+    replaces a real permission failure with a different one.
+
+    A no-op (returns rel_path verbatim) when permissions are disabled, there's
+    no current user, or rel_path fails to normalize -- in all of those cases
+    the caller's own subsequent checks are what should raise, not this.
+    """
+    if not config.VAULT_PERMISSIONS_ENABLED or not username:
+        return rel_path
+    try:
+        normalized = normalize_prefix(rel_path)
+    except ValueError:
+        return rel_path
+
+    if need.issubset(effective_bits(username, normalized)):
+        return rel_path
+
+    home = home_root(username)
+    if home is None:
+        return rel_path
+
+    candidate = home if not normalized else f"{home}/{normalized}"
+    if need.issubset(effective_bits(username, candidate)):
+        return candidate
+    return rel_path
+
+
 def enforce(rel_path: str, need: Literal["r", "w"], *, operation: str | None = None) -> None:
     """Raise PermissionDenied if the current request's user lacks `need` at
     rel_path. Also emits a best-effort audit denial record. No-ops entirely when

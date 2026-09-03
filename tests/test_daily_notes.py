@@ -1,14 +1,26 @@
 """Daily-note tools: path resolution, read (no create), append (create+template)."""
 
 import json
+from contextlib import contextmanager
 from datetime import datetime
 
-from obsidian_vault_mcp import config, server
+from obsidian_vault_mcp import config, context, server
 from obsidian_vault_mcp.tools.daily import (
     vault_daily_note_append,
     vault_daily_note_path,
     vault_daily_note_read,
 )
+
+
+@contextmanager
+def _as_user(username):
+    token = context.set_request_context(
+        principal="test-token", request_id="test-request", client=None, username=username,
+    )
+    try:
+        yield
+    finally:
+        context.reset_request_context(token)
 
 
 def _set_daily(monkeypatch, folder="", fmt="%Y-%m-%d", template=""):
@@ -54,6 +66,32 @@ def test_read_after_append_returns_content(vault_dir, monkeypatch):
     result = json.loads(vault_daily_note_read())
     assert "error" not in result
     assert "hello daily" in result["content"]
+
+
+def test_daily_note_auto_scopes_under_users_home_root_when_permissions_enabled(vault_dir, monkeypatch):
+    """VAULT_DAILY_NOTES_FOLDER is global (not per-user); with permissions
+    enabled and a user confined to their own root, the daily note must still
+    land in THEIR space rather than being denied at the (inaccessible) global
+    folder -- this was a real gap: enabling permissions broke daily notes for
+    every user until path scoping was added."""
+    _set_daily(monkeypatch, folder="")  # global folder = vault root
+    monkeypatch.setattr(config, "VAULT_PERMISSIONS_ENABLED", True)
+    monkeypatch.setattr(config, "VAULT_USER_ROOTS", {"shannon": [("shannon", "rw")]})
+
+    today = datetime.now().strftime("%Y-%m-%d") + ".md"
+    with _as_user("shannon"):
+        path_result = json.loads(vault_daily_note_path())
+        assert path_result["path"] == f"shannon/{today}"
+
+        append_result = json.loads(vault_daily_note_append("shannon's thought"))
+        assert "error" not in append_result
+        assert append_result["path"] == f"shannon/{today}"
+
+        read_result = json.loads(vault_daily_note_read())
+        assert "shannon's thought" in read_result["content"]
+
+    assert (vault_dir / "shannon" / today).exists()
+    assert not (vault_dir / today).exists()
 
 
 def test_tools_registered_and_append_wired(vault_dir, monkeypatch):

@@ -152,7 +152,7 @@ from .tools.canvas import (
     vault_canvas_add_edge as _vault_canvas_add_edge,
 )
 from .tools.daily import (
-    _daily_note_path,
+    _scoped_daily_note_path,
     _today,
     vault_daily_note_path as _vault_daily_note_path,
     vault_daily_note_read as _vault_daily_note_read,
@@ -606,7 +606,12 @@ def vault_daily_note_append(content: str) -> str:
     return _run_audited(
         "vault_daily_note_append",
         lambda: _vault_daily_note_append(inp.content),
-        path=_daily_note_path(_today()),
+        # Must match _vault_daily_note_append's own scoping (tools/daily.py) --
+        # otherwise the audit trail's BEFORE snapshot would target the raw,
+        # unscoped global path while the AFTER snapshot (taken from the tool's
+        # own result, which reports the true written path) targets the real
+        # one, producing a mismatched before/after pair for this tool alone.
+        path=_scoped_daily_note_path(_today(), frozenset("w")),
     )
 
 

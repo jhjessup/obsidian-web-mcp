@@ -24,7 +24,18 @@ def resolve_vault_path(relative_path: str, *, require: str | None = None) -> Pat
     permissions (permissions.py) for that path; see permissions.py's module
     docstring for what "current request" means outside a real request (nothing
     is granted).
+
+    When require is set, a path that isn't accessible to the current user AS
+    GIVEN is first transparently retried under that user's own root (see
+    permissions.scope_path) before being denied -- so "note.md" lands in a
+    user's own space without them needing to know or type their root's name,
+    while an already-valid path (their own root, or something shared with
+    them under a different prefix) is never touched.
     """
+    if require is not None:
+        username = context.current_request_context().get("username")
+        relative_path = permissions.scope_path(username, relative_path, frozenset(require))
+
     if "\x00" in relative_path:
         raise ValueError("Path contains null bytes")
 
@@ -238,6 +249,16 @@ def list_directory(
     # or under relative_path, this call has nothing to show -- deny it outright
     # rather than silently returning an empty list, which would be indistinguishable
     # from "this directory happens to be empty".
+    #
+    # Deliberately NOT auto-scoped under the user's own root the way
+    # resolve_vault_path's require= path is (permissions.scope_path): unlike a
+    # single file operation, a listing target can itself be something other
+    # than a directory the scoping fallback assumes (e.g. a user whose only
+    # granted prefix is a single file, not a folder), and has_readable_descendant
+    # already does the right thing for "" without any rewriting -- "" is an
+    # ancestor of every prefix, so it always has at least one readable
+    # descendant for a user with any access at all, and the per-entry walk
+    # below naturally surfaces only their own subtree.
     username = context.current_request_context().get("username")
     if not permissions.has_readable_descendant(username, relative_path):
         raise permissions.PermissionDenied("Permission denied")

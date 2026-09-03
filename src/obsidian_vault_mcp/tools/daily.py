@@ -9,6 +9,13 @@ the server's local date and three config knobs:
 
 Pure filesystem: no plugin, no network. Writes go through the existing
 ``vault_append`` path (atomic write); paths go through ``resolve_vault_path``.
+
+VAULT_DAILY_NOTES_FOLDER is a single, global setting -- not per-user -- so
+with permissions enabled it's transparently rescoped under the *current*
+user's own root the same way any other path is (permissions.scope_path),
+rather than each person needing their own folder configured. This is
+computed once per call, up front, so the path reported back in every
+response here is the one actually read/written, not the raw unscoped one.
 """
 
 import json
@@ -16,7 +23,8 @@ import logging
 from datetime import datetime
 from pathlib import PurePosixPath
 
-from .. import config
+from .. import config, permissions
+from ..context import current_request_context
 from ..serialization import dumps
 from ..vault import read_file, resolve_vault_path
 from .write import vault_append
@@ -40,6 +48,15 @@ def _daily_note_path(for_date) -> str:
     return filename
 
 
+def _scoped_daily_note_path(for_date, need: frozenset) -> str:
+    """The daily-note path for `for_date`, transparently rescoped under the
+    current user's own root when the configured (global) folder isn't
+    accessible to them as-is -- see module docstring."""
+    path = _daily_note_path(for_date)
+    username = current_request_context().get("username")
+    return permissions.scope_path(username, path, need)
+
+
 def _initial_content(content: str, for_date) -> str:
     """Template (if any) prepended to the first content written to a new note."""
     template = for_date.strftime(config.VAULT_DAILY_NOTES_TEMPLATE)
@@ -54,7 +71,7 @@ def vault_daily_note_path() -> str:
     """Return today's daily-note path using the server's local date."""
     day = _today()
     try:
-        path = _daily_note_path(day)
+        path = _scoped_daily_note_path(day, frozenset("r"))
         resolve_vault_path(path)
         return dumps({
             "path": path,
@@ -73,7 +90,7 @@ def vault_daily_note_read() -> str:
     """Read today's daily note. Returns an error payload when it does not exist
     (does not create it)."""
     day = _today()
-    path = _daily_note_path(day)
+    path = _scoped_daily_note_path(day, frozenset("r"))
     try:
         content, metadata = read_file(path)
         return dumps({"path": path, "date": day.isoformat(), "content": content, "metadata": metadata})
@@ -89,7 +106,7 @@ def vault_daily_note_read() -> str:
 def vault_daily_note_append(content: str) -> str:
     """Append to today's daily note, creating it (with the template) when missing."""
     day = _today()
-    path = _daily_note_path(day)
+    path = _scoped_daily_note_path(day, frozenset("w"))
     try:
         try:
             read_file(path)
