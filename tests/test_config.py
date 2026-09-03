@@ -11,9 +11,23 @@ import obsidian_vault_mcp.config as config_module
 
 @pytest.fixture(autouse=True)
 def _restore_config(monkeypatch):
-    """Reload config after each test so the module-level parse doesn't leak."""
+    """Reload config after each test so the module-level parse doesn't leak.
+
+    Must explicitly delenv here rather than rely on monkeypatch's own
+    auto-revert-on-teardown: fixture teardown order is reverse-of-setup, and this
+    fixture requests `monkeypatch` as a dependency, so `monkeypatch` is set up
+    *before* this fixture and therefore torn down (auto-reverting env) *after* this
+    fixture's own post-yield code already ran. Reloading here without first
+    explicitly clearing would reload against still-dirty env and leak this test's
+    values into every test that runs afterward for the rest of the session --
+    exactly what happened before this comment existed (VAULT_USER_BROKEN_* leaking
+    into unrelated test_extensions.py failures).
+    """
     yield
     monkeypatch.delenv("VAULT_MCP_ALLOWED_HOSTS", raising=False)
+    for key in list(os.environ):
+        if key.startswith("VAULT_USER_"):
+            monkeypatch.delenv(key, raising=False)
     importlib.reload(config_module)
 
 
