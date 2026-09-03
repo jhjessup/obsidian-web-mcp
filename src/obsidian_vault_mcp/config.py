@@ -1,4 +1,5 @@
 import os
+import re
 from pathlib import Path
 
 # Vault configuration
@@ -6,32 +7,54 @@ VAULT_PATH = Path(os.environ.get("VAULT_PATH", os.path.expanduser("~/Obsidian/My
 VAULT_MCP_PORT = int(os.environ.get("VAULT_MCP_PORT", "8420"))
 
 
-def _parse_pairs(raw: str) -> dict[str, str]:
-    """Parse a "name:value,name2:value2" (comma- or newline-separated) list into a dict.
+_USER_ENV_RE = re.compile(r"^VAULT_USER_(.+)_USERNAME$")
 
-    Splits each entry on the FIRST colon only, so a value is free to contain colons
-    itself. Blank entries (extra separators, trailing newline) are skipped. Used for
-    both VAULT_OAUTH_USERS and VAULT_MCP_TOKENS, which share this exact shape.
+
+def _load_users_from_env() -> tuple[dict[str, str], dict[str, str], list[str]]:
+    """Build (VAULT_OAUTH_USERS, VAULT_MCP_TOKENS, incomplete_groups) from one
+    env-var triple per user: VAULT_USER_<GROUP>_USERNAME / _PASSWORD / _TOKEN, where
+    <GROUP> is an arbitrary grouping key (not read or validated itself -- it only
+    ties the three vars for one person together; using the username itself,
+    uppercased, is the readable choice but any distinct string works).
+
+    Replaced the old single VAULT_OAUTH_USERS/VAULT_MCP_TOKENS multi-line blobs
+    (each holding every user at once) with this per-user-triple shape specifically so
+    each person's Kubernetes Secret can be independent -- adding, rotating, or
+    removing one person's credentials no longer means regenerating a blob containing
+    everyone else's still-current lines too. A person's three env vars typically all
+    come from one Secret (via envFrom + a per-Secret `prefix:`), but nothing here
+    requires that -- this just scans whatever's in the environment.
+
+    incomplete_groups (a username set but its password or token missing) is
+    returned rather than raised here, so every other config value still loads and
+    server.main()'s fail-closed path (validate_config -> sys.exit(1)) is the one
+    place startup actually aborts, consistent with every other validated value in
+    this module.
     """
-    pairs: dict[str, str] = {}
-    for chunk in raw.replace("\n", ",").split(","):
-        chunk = chunk.strip()
-        if not chunk:
+    users: dict[str, str] = {}
+    tokens: dict[str, str] = {}
+    incomplete: list[str] = []
+
+    for key in os.environ:
+        m = _USER_ENV_RE.match(key)
+        if not m:
             continue
-        name, sep, value = chunk.partition(":")
-        if not sep:
+        group = m.group(1)
+        username = os.environ[key].strip()
+        password = os.environ.get(f"VAULT_USER_{group}_PASSWORD", "").strip()
+        token = os.environ.get(f"VAULT_USER_{group}_TOKEN", "").strip()
+        if not username:
             continue
-        pairs[name.strip()] = value.strip()
-    return pairs
+        if not password or not token:
+            incomplete.append(group)
+            continue
+        users[username] = password
+        tokens[username] = token
+
+    return users, tokens, sorted(incomplete)
 
 
-# Per-user bearer tokens, "username:token,username2:token2". Each entry in
-# VAULT_OAUTH_USERS below must have a matching entry here (enforced in
-# validate_config()) -- every human who can log in gets their own token, rather than
-# every login sharing one static VAULT_MCP_TOKEN. This is what lets the audit log
-# (see audit.py) attribute a mutation to a specific person instead of an
-# indistinguishable shared credential.
-VAULT_MCP_TOKENS = _parse_pairs(os.environ.get("VAULT_MCP_TOKENS", ""))
+VAULT_OAUTH_USERS, VAULT_MCP_TOKENS, _INCOMPLETE_USER_GROUPS = _load_users_from_env()
 
 # Daily-note tools. FOLDER "" means the vault root; FORMAT/TEMPLATE are strftime
 # patterns. All optional with safe defaults; resolved paths still go through
@@ -59,12 +82,10 @@ VAULT_OAUTH_CLIENT_SECRET = os.environ.get("VAULT_OAUTH_CLIENT_SECRET", "")
 # A password is required on every authorization, so there is no ambient session
 # cookie for a cross-site request to ride on.
 #
-# VAULT_OAUTH_USERS holds one or more "username:password" pairs, comma- or
-# newline-separated -- each a distinct human who may log in, each with their own
-# token in VAULT_MCP_TOKENS. Kept as VAULT_OAUTH_USERS (not a single pair) because
-# the previous single-username/password model gave every logged-in client the exact
-# same downstream bearer token, making two people indistinguishable in the audit log.
-VAULT_OAUTH_USERS = _parse_pairs(os.environ.get("VAULT_OAUTH_USERS", ""))
+# VAULT_OAUTH_USERS (built above, from VAULT_USER_<GROUP>_* env vars) holds each
+# distinct human who may log in, each with their own token in VAULT_MCP_TOKENS --
+# not a single shared pair, because that gave every logged-in client the exact same
+# downstream bearer token, making two people indistinguishable in the audit log.
 
 # Allowed redirect URIs for the operator-configured client (VAULT_OAUTH_CLIENT_ID),
 # comma-separated. Dynamically-registered clients carry their own redirect_uris; this
@@ -254,15 +275,20 @@ def _validate_mcp_path(path: str) -> None:
 def _validate_users_have_tokens() -> None:
     """Every configured login must have a matching bearer token.
 
-    A username in VAULT_OAUTH_USERS with no entry in VAULT_MCP_TOKENS would let
-    that person log in but then hit "server misconfigured" on every MCP call --
-    fail closed at startup instead, with a message naming the gap.
+    _load_users_from_env() already guarantees VAULT_OAUTH_USERS and VAULT_MCP_TOKENS
+    are pairwise consistent (an incomplete VAULT_USER_<GROUP>_* triple is excluded
+    from both rather than added to one). What it can't rule out is a *username set
+    with its password or token missing* -- that's a real per-Secret typo (e.g. one
+    key omitted when generating a person's SealedSecret), and letting that person's
+    login silently vanish rather than erroring is exactly the kind of gap that would
+    otherwise surface as a confusing runtime 401 instead of an explained startup
+    failure.
     """
-    missing = sorted(set(VAULT_OAUTH_USERS) - set(VAULT_MCP_TOKENS))
-    if missing:
+    if _INCOMPLETE_USER_GROUPS:
         raise ValueError(
-            "VAULT_MCP_TOKENS is missing an entry for: " + ", ".join(missing) +
-            " -- every user in VAULT_OAUTH_USERS needs a matching token."
+            "Incomplete VAULT_USER_<GROUP>_* triple for: " +
+            ", ".join(_INCOMPLETE_USER_GROUPS) +
+            " -- each group needs all three of _USERNAME, _PASSWORD, and _TOKEN set."
         )
 
 
